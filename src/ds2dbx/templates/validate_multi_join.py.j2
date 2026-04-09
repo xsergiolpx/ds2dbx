@@ -1,0 +1,96 @@
+# Databricks notebook source
+
+# MAGIC %md
+# MAGIC # Validation: Multi-Join Pipeline
+# MAGIC
+# MAGIC **Main table:** `{{ catalog }}.{{ schema }}.{{ main_table }}`
+# MAGIC **Target table:** `{{ catalog }}.{{ schema }}.{{ target_table }}`
+
+# COMMAND ----------
+
+spark.sql("USE CATALOG {{ catalog }}")
+spark.sql("USE SCHEMA {{ schema }}")
+
+results = []
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 1: Row count comparison
+
+# COMMAND ----------
+
+main_count = spark.sql("SELECT COUNT(*) AS cnt FROM {{ catalog }}.{{ schema }}.{{ main_table }}").collect()[0]["cnt"]
+target_count = spark.sql("SELECT COUNT(*) AS cnt FROM {{ catalog }}.{{ schema }}.{{ target_table }}").collect()[0]["cnt"]
+
+print(f"Main table ({{ main_table }}):   {main_count} rows")
+print(f"Target table ({{ target_table }}): {target_count} rows")
+
+if main_count == target_count:
+    print("PASS: Row counts match")
+    results.append(("Row count match", "PASS"))
+else:
+    diff = target_count - main_count
+    print(f"WARN: Row count difference = {diff} (may be expected for outer joins)")
+    results.append(("Row count match", f"WARN: diff={diff}"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 2: Lookup columns are not all NULL
+
+# COMMAND ----------
+
+{% for col in lookup_columns %}
+null_count_{{ col }} = spark.sql("""
+    SELECT COUNT(*) AS cnt FROM {{ catalog }}.{{ schema }}.{{ target_table }}
+    WHERE {{ col }} IS NULL
+""").collect()[0]["cnt"]
+null_pct_{{ col }} = (null_count_{{ col }} / target_count * 100) if target_count > 0 else 0
+
+if null_pct_{{ col }} == 100.0:
+    print(f"FAIL: {{ col }} is 100% NULL - lookup may have failed")
+    results.append(("Lookup {{ col }}", "FAIL: 100% NULL"))
+elif null_pct_{{ col }} > 50.0:
+    print(f"WARN: {{ col }} is {null_pct_{{ col }}:.1f}% NULL")
+    results.append(("Lookup {{ col }}", f"WARN: {null_pct_{{ col }}:.1f}% NULL"))
+else:
+    print(f"PASS: {{ col }} is {null_pct_{{ col }}:.1f}% NULL")
+    results.append(("Lookup {{ col }}", "PASS"))
+{% endfor %}
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 3: Audit columns present in target
+
+# COMMAND ----------
+
+target_columns = [f.name for f in spark.table("{{ catalog }}.{{ schema }}.{{ target_table }}").schema.fields]
+{% for col in audit_columns %}
+if "{{ col }}" in target_columns:
+    print(f"PASS: Audit column '{{ col }}' exists")
+    results.append(("Audit col {{ col }}", "PASS"))
+else:
+    print(f"FAIL: Audit column '{{ col }}' missing from target")
+    results.append(("Audit col {{ col }}", "FAIL"))
+{% endfor %}
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary
+
+# COMMAND ----------
+
+print("=" * 50)
+print("VALIDATION SUMMARY")
+print("=" * 50)
+for check_name, status in results:
+    print(f"  {status:30s} | {check_name}")
+print("=" * 50)
+failures = [r for r in results if r[1].startswith("FAIL")]
+if failures:
+    print(f"\n{len(failures)} check(s) FAILED")
+else:
+    print("\nAll checks passed")

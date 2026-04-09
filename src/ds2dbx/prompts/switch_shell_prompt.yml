@@ -1,0 +1,133 @@
+system_message: |
+  Convert Impala/Hive shell scripts (.sh) to Databricks-compatible Python code using spark.sql().
+
+  # Input and Output
+  - Input: Bash shell scripts that execute SQL via impala-shell, beeline, or hive CLI.
+  - Output: Python code using spark.sql() suitable for execution in a Databricks notebook. Python comments in {comment_lang}.
+
+  ${common_python_instructions_and_guidelines}
+
+  # Impala/Hive Shell Script Specific Guidelines
+
+  ## 1. SQL Execution Replacement:
+  - Replace `impala-shell -q "..."` and `impala-shell -f file.sql` with `spark.sql("""...""")`
+  - Replace `beeline -e "..."` and `hive -e "..."` with `spark.sql("""...""")`
+  - Each SQL statement gets its own `spark.sql()` call
+
+  ## 2. Kudu DML to Delta:
+  - Convert Kudu `UPSERT INTO target SELECT ...` to Delta `MERGE INTO`:
+    ```python
+    spark.sql("""
+    MERGE INTO catalog.schema.target AS t
+    USING (SELECT ...) AS s
+    ON t.key = s.key
+    WHEN MATCHED THEN UPDATE SET *
+    WHEN NOT MATCHED THEN INSERT *
+    """)
+    ```
+  - Convert INSERT/UPDATE patterns that form an upsert into a single MERGE INTO
+  - Keep simple DELETE FROM as-is
+
+  ## 3. Parameters and Variables:
+  - Convert shell positional parameters `$1`, `$2`, etc. to `dbutils.widgets`:
+    ```python
+    dbutils.widgets.text("param1", "", "Parameter 1")
+    param1 = dbutils.widgets.get("param1")
+    ```
+  - Convert shell variables like `DATE_VAR=$(date +%Y-%m-%d)` to Python:
+    ```python
+    from datetime import datetime
+    date_var = datetime.now().strftime("%Y-%m-%d")
+    ```
+  - Use f-strings to inject parameters into SQL
+
+  ## 4. Remove Infrastructure Commands:
+  - Remove `kinit` / Kerberos authentication lines entirely
+  - Remove `ssh` commands and remote execution wrappers
+  - Remove `source /path/to/config` — replace referenced variables with dbutils.widgets
+  - Remove `hadoop fs` / `hdfs dfs` commands
+
+  ## 5. Remove Impala/Hive-Specific Commands:
+  - Remove `INVALIDATE METADATA` statements
+  - Remove `REFRESH table_name` statements
+  - Remove `COMPUTE STATS` / `COMPUTE INCREMENTAL STATS` (Databricks handles stats automatically)
+  - Remove `SET SYNC_DDL=1` and other Impala SET commands
+  - Remove `SET hive.exec.dynamic.partition.mode=nonstrict` and similar Hive config
+
+  ## 6. Function Mappings:
+  - `datalake.sha256(col)` => `sha2(col, 256)`
+  - `datalake.md5(col)` => `md5(col)`
+  - `from_unixtime(unix_timestamp())` => `current_timestamp()`
+  - `strleft(col, n)` / `strright(col, n)` => `left(col, n)` / `right(col, n)`
+
+  ## 7. Table References:
+  - All table references must use Unity Catalog three-level namespace: `catalog.schema.table_name`
+  - The catalog and schema are provided as TARGET CATALOG and TARGET SCHEMA comments in the input
+
+  ## 8. Business Logic:
+  - Preserve ALL business logic exactly — every WHERE clause, every JOIN condition, every CASE expression
+  - Preserve the execution order of SQL statements
+  - Preserve comments that explain business rules
+
+few_shots:
+  - role: user
+    content: |
+      # TARGET CATALOG: bank_prod
+      # TARGET SCHEMA: core
+
+      #!/bin/bash
+      source /opt/config/db_env.conf
+      kinit -kt /etc/keytab user@REALM
+
+      DATE=$1
+      BATCH_ID=$2
+
+      impala-shell -q "INVALIDATE METADATA core.account_daily"
+      impala-shell -q "
+        DELETE FROM core.account_daily
+        WHERE process_date = '${DATE}'
+      "
+      impala-shell -q "
+        INSERT INTO core.account_daily
+        SELECT
+          account_id,
+          balance,
+          datalake.sha256(account_number) as account_hash,
+          '${DATE}' as process_date,
+          ${BATCH_ID} as batch_id
+        FROM staging.accounts_raw
+        WHERE load_date = '${DATE}'
+      "
+      impala-shell -q "COMPUTE STATS core.account_daily"
+
+  - role: assistant
+    content: |
+      # Widget definitions for script parameters
+      dbutils.widgets.text("process_date", "", "Process Date (YYYY-MM-DD)")
+      dbutils.widgets.text("batch_id", "", "Batch ID")
+
+      process_date = dbutils.widgets.get("process_date")
+      batch_id = dbutils.widgets.get("batch_id")
+
+      # Setup: Set catalog and schema
+      spark.sql("USE CATALOG bank_prod")
+      spark.sql("USE SCHEMA core")
+
+      # Delete existing records for the process date
+      spark.sql(f"""
+        DELETE FROM bank_prod.core.account_daily
+        WHERE process_date = '{process_date}'
+      """)
+
+      # Insert new records (sha256 replaces datalake.sha256)
+      spark.sql(f"""
+        INSERT INTO bank_prod.core.account_daily
+        SELECT
+          account_id,
+          balance,
+          sha2(account_number, 256) AS account_hash,
+          '{process_date}' AS process_date,
+          {batch_id} AS batch_id
+        FROM bank_prod.staging.accounts_raw
+        WHERE load_date = '{process_date}'
+      """)

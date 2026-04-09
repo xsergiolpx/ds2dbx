@@ -1,0 +1,135 @@
+# Databricks notebook source
+
+# MAGIC %md
+# MAGIC # Validation: SCD Type 2
+# MAGIC
+# MAGIC **Target table:** `{{ catalog }}.{{ schema }}.{{ target_table }}`
+# MAGIC **Business keys:** {{ business_keys | join(', ') }}
+# MAGIC **Version flag:** `{{ version_flag_col }}`
+# MAGIC **Valid from:** `{{ valid_from_col }}` | **Valid to:** `{{ valid_to_col }}`
+
+# COMMAND ----------
+
+spark.sql("USE CATALOG {{ catalog }}")
+spark.sql("USE SCHEMA {{ schema }}")
+
+TABLE = "{{ catalog }}.{{ schema }}.{{ target_table }}"
+BK_COLS = "{{ business_keys | join(', ') }}"
+
+results = []
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 1: Exactly one current record per business key
+
+# COMMAND ----------
+
+df_dup_current = spark.sql(f"""
+    SELECT {BK_COLS}, COUNT(*) AS cnt
+    FROM {TABLE}
+    WHERE {{ version_flag_col }} = true
+    GROUP BY {BK_COLS}
+    HAVING COUNT(*) > 1
+""")
+
+dup_count = df_dup_current.count()
+if dup_count == 0:
+    print("PASS: Every business key has exactly one current record")
+    results.append(("Unique current record per BK", "PASS"))
+else:
+    print(f"FAIL: {dup_count} business key(s) have multiple current records")
+    df_dup_current.show(10, truncate=False)
+    results.append(("Unique current record per BK", f"FAIL: {dup_count} duplicates"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 2: Current records have valid_to = '9999-12-31'
+
+# COMMAND ----------
+
+bad_current = spark.sql(f"""
+    SELECT COUNT(*) AS cnt FROM {TABLE}
+    WHERE {{ version_flag_col }} = true
+      AND CAST({{ valid_to_col }} AS DATE) != DATE '9999-12-31'
+""").collect()[0]["cnt"]
+
+if bad_current == 0:
+    print("PASS: All current records have valid_to = 9999-12-31")
+    results.append(("Current valid_to = 9999-12-31", "PASS"))
+else:
+    print(f"FAIL: {bad_current} current record(s) have valid_to != 9999-12-31")
+    results.append(("Current valid_to = 9999-12-31", f"FAIL: {bad_current} rows"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 3: Superseded records are properly closed
+
+# COMMAND ----------
+
+open_superseded = spark.sql(f"""
+    SELECT COUNT(*) AS cnt FROM {TABLE}
+    WHERE {{ version_flag_col }} = false
+      AND CAST({{ valid_to_col }} AS DATE) = DATE '9999-12-31'
+""").collect()[0]["cnt"]
+
+if open_superseded == 0:
+    print("PASS: All superseded records have a closed valid_to date")
+    results.append(("Superseded records closed", "PASS"))
+else:
+    print(f"FAIL: {open_superseded} superseded record(s) still have valid_to = 9999-12-31")
+    results.append(("Superseded records closed", f"FAIL: {open_superseded} rows"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 4: No date gaps between versions
+
+# COMMAND ----------
+
+df_gaps = spark.sql(f"""
+    WITH versioned AS (
+        SELECT
+            {BK_COLS},
+            {{ valid_from_col }},
+            {{ valid_to_col }},
+            LEAD({{ valid_from_col }}) OVER (
+                PARTITION BY {BK_COLS} ORDER BY {{ valid_from_col }}
+            ) AS next_valid_from
+        FROM {TABLE}
+    )
+    SELECT *
+    FROM versioned
+    WHERE next_valid_from IS NOT NULL
+      AND CAST({{ valid_to_col }} AS DATE) != CAST(next_valid_from AS DATE)
+""")
+
+gap_count = df_gaps.count()
+if gap_count == 0:
+    print("PASS: No date gaps between consecutive versions")
+    results.append(("No date gaps", "PASS"))
+else:
+    print(f"FAIL: {gap_count} gap(s) found between version date ranges")
+    df_gaps.show(10, truncate=False)
+    results.append(("No date gaps", f"FAIL: {gap_count} gaps"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary
+
+# COMMAND ----------
+
+print("=" * 50)
+print("SCD2 VALIDATION SUMMARY")
+print("=" * 50)
+for check_name, status in results:
+    print(f"  {status:30s} | {check_name}")
+print("=" * 50)
+failures = [r for r in results if r[1].startswith("FAIL")]
+if failures:
+    print(f"\n{len(failures)} check(s) FAILED")
+else:
+    print("\nAll checks passed")

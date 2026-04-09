@@ -1,0 +1,119 @@
+# Databricks notebook source
+
+# MAGIC %md
+# MAGIC # Validation: File Ingestion Pipeline
+# MAGIC
+# MAGIC **Staging table:** `{{ catalog }}.{{ schema }}.{{ staging_table }}`
+# MAGIC **Target table:** `{{ catalog }}.{{ schema }}.{{ target_table }}`
+# MAGIC **Expected count:** `{{ expected_count }}`
+
+# COMMAND ----------
+
+spark.sql("USE CATALOG {{ catalog }}")
+spark.sql("USE SCHEMA {{ schema }}")
+
+results = []
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 1: Record count matches expected
+
+# COMMAND ----------
+
+staging_count = spark.sql("SELECT COUNT(*) AS cnt FROM {{ catalog }}.{{ schema }}.{{ staging_table }}").collect()[0]["cnt"]
+target_count = spark.sql("SELECT COUNT(*) AS cnt FROM {{ catalog }}.{{ schema }}.{{ target_table }}").collect()[0]["cnt"]
+
+print(f"Staging table: {staging_count} rows")
+print(f"Target table:  {target_count} rows")
+print(f"Expected:      {{ expected_count }} rows")
+
+if target_count == {{ expected_count }}:
+    print("PASS: Target count matches expected")
+    results.append(("Target count matches expected", "PASS"))
+elif staging_count == {{ expected_count }}:
+    print(f"WARN: Staging matches expected but target has {target_count} rows")
+    results.append(("Target count matches expected", f"WARN: target={target_count}"))
+else:
+    print(f"FAIL: Neither staging ({staging_count}) nor target ({target_count}) match expected ({{ expected_count }})")
+    results.append(("Target count matches expected", "FAIL"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 2: Partitions are correct
+{% if partition_cols %}
+
+# COMMAND ----------
+
+{% for col in partition_cols %}
+partitions_{{ col }} = spark.sql("""
+    SELECT DISTINCT {{ col }} FROM {{ catalog }}.{{ schema }}.{{ target_table }}
+    ORDER BY {{ col }}
+""")
+print(f"Partition column '{{ col }}' has {partitions_{{ col }}.count()} distinct values:")
+partitions_{{ col }}.show(20, truncate=False)
+{% endfor %}
+
+results.append(("Partitions present", "PASS (visual check)"))
+{% else %}
+
+# COMMAND ----------
+
+print("No partition columns specified - skipping partition check")
+results.append(("Partitions present", "SKIP: no partition cols defined"))
+{% endif %}
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 3: No header/footer leakage
+
+# COMMAND ----------
+
+# Sample first and last rows to check for header/footer text leaking into data
+print("=== First 3 rows of target ===")
+spark.sql("SELECT * FROM {{ catalog }}.{{ schema }}.{{ target_table }} LIMIT 3").show(truncate=False)
+
+print("=== Checking for common header patterns ===")
+target_schema = spark.table("{{ catalog }}.{{ schema }}.{{ target_table }}").schema
+first_string_col = None
+for f in target_schema.fields:
+    if str(f.dataType) == "StringType":
+        first_string_col = f.name
+        break
+
+if first_string_col:
+    header_check = spark.sql(f"""
+        SELECT COUNT(*) AS cnt FROM {{ catalog }}.{{ schema }}.{{ target_table }}
+        WHERE LOWER({first_string_col}) RLIKE '^(header|trailer|hdr|trl|record_count|total|footer|h\\|)'
+    """).collect()[0]["cnt"]
+
+    if header_check == 0:
+        print("PASS: No header/footer patterns detected")
+        results.append(("No header/footer leakage", "PASS"))
+    else:
+        print(f"WARN: {header_check} row(s) match header/footer patterns in column '{first_string_col}'")
+        results.append(("No header/footer leakage", f"WARN: {header_check} suspicious rows"))
+else:
+    print("SKIP: No string columns found to check")
+    results.append(("No header/footer leakage", "SKIP"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary
+
+# COMMAND ----------
+
+print("=" * 50)
+print("FILE INGESTION VALIDATION SUMMARY")
+print("=" * 50)
+for check_name, status in results:
+    print(f"  {status:30s} | {check_name}")
+print("=" * 50)
+failures = [r for r in results if r[1].startswith("FAIL")]
+if failures:
+    print(f"\n{len(failures)} check(s) FAILED")
+else:
+    print("\nAll checks passed")

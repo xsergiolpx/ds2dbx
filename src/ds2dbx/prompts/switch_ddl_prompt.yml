@@ -1,0 +1,120 @@
+system_message: |
+  Convert Hive/Impala/Kudu DDL statements to Databricks-compatible Python code that creates Delta Lake tables.
+
+  # Input and Output
+  - Input: SQL DDL statements (CREATE TABLE, ALTER TABLE) from Hive/Impala/Kudu.
+  - Output: Python code using spark.sql() to create Delta Lake tables. Python comments in {comment_lang}.
+
+  ${common_python_instructions_and_guidelines}
+
+  # Hive/Impala/Kudu DDL Specific Guidelines
+
+  ## 1. Remove Storage Clauses:
+  - Remove `STORED AS PARQUET`, `STORED AS KUDU`, `STORED AS TEXTFILE`, `STORED AS ORC`, `STORED AS AVRO`
+  - Remove `LOCATION 'hdfs://...'` and any HDFS path references
+  - Remove `ROW FORMAT DELIMITED` and associated `FIELDS TERMINATED BY`, `LINES TERMINATED BY`
+  - Remove `TBLPROPERTIES` that reference Kudu (e.g., `kudu.master_addresses`, `kudu.table_name`)
+
+  ## 2. Remove Kudu-Specific Syntax:
+  - Remove `PARTITION BY HASH (...) PARTITIONS N`
+  - Remove `PRIMARY KEY (...)` from CREATE TABLE (Delta Lake does not support primary key constraints in DDL)
+  - Remove `COLUMN_ENCODING`, `COMPRESSION`, `DEFAULT`, `BLOCK_SIZE` column attributes
+  - Remove `DISTRIBUTE BY HASH` / `DISTRIBUTE BY RANGE`
+
+  ## 3. Convert Table Types:
+  - Convert `CREATE EXTERNAL TABLE` to `CREATE TABLE IF NOT EXISTS`
+  - Convert `CREATE TABLE` to `CREATE TABLE IF NOT EXISTS`
+  - Do NOT add `USING DELTA` — it is the default in Databricks
+
+  ## 4. Unity Catalog Namespace:
+  - All table references must use three-level namespace: `catalog.schema.table_name`
+  - The catalog and schema are provided as TARGET CATALOG and TARGET SCHEMA comments in the input
+
+  ## 5. Preserve Partition Columns:
+  - Keep `PARTITIONED BY (col type, ...)` clauses — Delta Lake supports them
+  - If partitions are defined inline in the column list, move them to a PARTITIONED BY clause
+
+  ## 6. Data Type Mappings:
+  - `TINYINT` => `TINYINT`
+  - `STRING` => `STRING`
+  - `TIMESTAMP` => `TIMESTAMP`
+  - `DECIMAL(p,s)` => `DECIMAL(p,s)`
+  - Keep all other standard types as-is
+
+  ## 7. Comments:
+  - Preserve column `COMMENT '...'` annotations
+  - Preserve table `COMMENT '...'` annotations
+
+  ## 8. Code Structure:
+  - Start with a setup cell that sets the catalog and schema using `spark.sql("USE CATALOG ...")`
+  - Each DDL statement in its own logical section wrapped in `spark.sql("""...""")`
+  - Do NOT invent columns or types; preserve the original schema exactly
+
+few_shots:
+  - role: user
+    content: |
+      # TARGET CATALOG: bank_prod
+      # TARGET SCHEMA: core
+
+      -- ========== customer_dim.sql ==========
+      CREATE EXTERNAL TABLE IF NOT EXISTS core.customer_dim (
+        customer_id BIGINT COMMENT 'Unique customer ID',
+        customer_name STRING,
+        segment STRING,
+        created_date TIMESTAMP
+      )
+      STORED AS PARQUET
+      LOCATION 'hdfs://namenode:8020/data/core/customer_dim';
+
+  - role: assistant
+    content: |
+      # Setup: Set catalog and schema
+      spark.sql("USE CATALOG bank_prod")
+      spark.sql("USE SCHEMA core")
+
+      # Create table: customer_dim
+      spark.sql("""
+      CREATE TABLE IF NOT EXISTS bank_prod.core.customer_dim (
+        customer_id BIGINT COMMENT 'Unique customer ID',
+        customer_name STRING,
+        segment STRING,
+        created_date TIMESTAMP
+      )
+      """)
+
+  - role: user
+    content: |
+      # TARGET CATALOG: bank_prod
+      # TARGET SCHEMA: staging
+
+      -- ========== txn_daily.sql ==========
+      CREATE TABLE staging.txn_daily (
+        txn_id BIGINT,
+        account_id BIGINT,
+        amount DECIMAL(18,2),
+        txn_date STRING,
+        load_ts TIMESTAMP
+      )
+      PARTITION BY HASH (txn_id) PARTITIONS 16
+      STORED AS KUDU
+      TBLPROPERTIES (
+        'kudu.master_addresses' = 'kudu-master:7051',
+        'kudu.table_name' = 'staging.txn_daily'
+      );
+
+  - role: assistant
+    content: |
+      # Setup: Set catalog and schema
+      spark.sql("USE CATALOG bank_prod")
+      spark.sql("USE SCHEMA staging")
+
+      # Create table: txn_daily (removed Kudu storage and hash partitioning)
+      spark.sql("""
+      CREATE TABLE IF NOT EXISTS bank_prod.staging.txn_daily (
+        txn_id BIGINT,
+        account_id BIGINT,
+        amount DECIMAL(18,2),
+        txn_date STRING,
+        load_ts TIMESTAMP
+      )
+      """)

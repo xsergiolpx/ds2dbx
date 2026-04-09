@@ -1,0 +1,52 @@
+# Databricks notebook source
+
+# MAGIC %md
+# MAGIC # Data Loader: Load CSV files into Delta tables
+# MAGIC
+# MAGIC **Catalog:** `{{ catalog }}`
+# MAGIC **Schema:** `{{ schema }}`
+# MAGIC **Volume path:** `{{ volume_path }}`
+
+# COMMAND ----------
+
+spark.sql("USE CATALOG {{ catalog }}")
+spark.sql("USE SCHEMA {{ schema }}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Load tables
+{% for table in tables %}
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### {{ table.table_name }}
+# MAGIC Source file: `{{ table.filename }}`
+
+# COMMAND ----------
+
+df_{{ table.table_name }} = (
+    spark.read
+    .option("header", "{{ 'true' if table.has_header else 'false' }}")
+    .option("inferSchema", "true")
+    .option("sep", "{{ table.delimiter }}")
+    .csv("{{ volume_path }}/{{ table.filename }}")
+)
+print(f"{{ table.table_name }}: {df_{{ table.table_name }}.count()} rows, {len(df_{{ table.table_name }}.columns)} columns")
+df_{{ table.table_name }}.write.mode("overwrite").saveAsTable("{{ catalog }}.{{ schema }}.{{ table.table_name }}")
+{% endfor %}
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Verification
+
+# COMMAND ----------
+
+print("=== Loaded Tables ===")
+{% for table in tables %}
+count_{{ table.table_name }} = spark.sql("SELECT COUNT(*) AS cnt FROM {{ catalog }}.{{ schema }}.{{ table.table_name }}").collect()[0]["cnt"]
+print(f"{{ table.table_name }}: {count_{{ table.table_name }}} rows")
+{% endfor %}
+print("=== Done ===")

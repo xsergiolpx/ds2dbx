@@ -1,0 +1,101 @@
+# Databricks notebook source
+
+# MAGIC %md
+# MAGIC # Validation: Generic Table Checks
+# MAGIC
+# MAGIC **Catalog:** `{{ catalog }}`
+# MAGIC **Schema:** `{{ schema }}`
+# MAGIC **Tables:** {{ tables | join(', ') }}
+
+# COMMAND ----------
+
+spark.sql("USE CATALOG {{ catalog }}")
+spark.sql("USE SCHEMA {{ schema }}")
+
+results = []
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 1: Each table has rows
+{% for table in tables %}
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### {{ table }}
+
+# COMMAND ----------
+
+try:
+    df_{{ table }} = spark.table("{{ catalog }}.{{ schema }}.{{ table }}")
+    count_{{ table }} = df_{{ table }}.count()
+
+    if count_{{ table }} > 0:
+        print(f"PASS: {{ table }} has {count_{{ table }}} rows")
+        results.append(("{{ table }} has rows", "PASS"))
+    else:
+        print(f"FAIL: {{ table }} is empty (0 rows)")
+        results.append(("{{ table }} has rows", "FAIL: 0 rows"))
+except Exception as e:
+    print(f"FAIL: {{ table }} - {e}")
+    results.append(("{{ table }} has rows", f"FAIL: {e}"))
+{% endfor %}
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 2: Schema is non-empty
+{% for table in tables %}
+
+# COMMAND ----------
+
+try:
+    schema_{{ table }} = spark.table("{{ catalog }}.{{ schema }}.{{ table }}").schema
+    col_count = len(schema_{{ table }}.fields)
+    col_names = [f.name for f in schema_{{ table }}.fields]
+
+    if col_count > 0:
+        print(f"PASS: {{ table }} has {col_count} columns: {col_names}")
+        results.append(("{{ table }} schema non-empty", "PASS"))
+    else:
+        print(f"FAIL: {{ table }} has no columns")
+        results.append(("{{ table }} schema non-empty", "FAIL"))
+except Exception as e:
+    print(f"FAIL: {{ table }} schema check - {e}")
+    results.append(("{{ table }} schema non-empty", f"FAIL: {e}"))
+{% endfor %}
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Check 3: Sample data
+{% for table in tables %}
+
+# COMMAND ----------
+
+print(f"=== {{ table }} (first 5 rows) ===")
+try:
+    spark.table("{{ catalog }}.{{ schema }}.{{ table }}").show(5, truncate=False)
+except Exception as e:
+    print(f"Could not display {{ table }}: {e}")
+{% endfor %}
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary
+
+# COMMAND ----------
+
+print("=" * 50)
+print("GENERIC VALIDATION SUMMARY")
+print("=" * 50)
+for check_name, status in results:
+    print(f"  {status:30s} | {check_name}")
+print("=" * 50)
+failures = [r for r in results if r[1].startswith("FAIL")]
+if failures:
+    print(f"\n{len(failures)} check(s) FAILED")
+else:
+    print("\nAll checks passed")

@@ -1,0 +1,132 @@
+bugs:
+  # ── Critical ────────────────────────────────────────────────────────────────
+  - name: "unnecessary_oracledb_import"
+    pattern: "import oracledb"
+    severity: "critical"
+    description: "Unnecessary import - not available on Databricks Serverless"
+
+  - name: "unnecessary_sparkcontext"
+    pattern: "from pyspark import SparkContext"
+    severity: "critical"
+    description: "Unnecessary import on Databricks"
+
+  - name: "temp_table_hash_ref"
+    pattern: "TEMP_TABLE_.*#"
+    severity: "critical"
+    description: "Reference to temp table with trailing hash - invalid SQL identifier"
+
+  - name: "tfrs9_prm_hash_ref"
+    pattern: "#TFRS9_PRM\\..*#"
+    severity: "critical"
+    description: "Reference to TFRS9_PRM temp table with hash delimiters - invalid SQL identifier"
+
+  - name: "broken_withcolumn_chain"
+    pattern: "\\)\\s*\\n\\s*\\.with"
+    severity: "critical"
+    description: "Broken .withColumn chain - closing paren and .with on separate lines without continuation"
+    multiline: true
+
+  - name: "unquoted_sep_option"
+    pattern: "\\.option\\(sep,"
+    severity: "critical"
+    description: "Unquoted sep in .option() - should be .option('sep', ...)"
+
+  - name: "non_interpolated_path"
+    pattern: "'\\{[^}]+\\}'"
+    severity: "critical"
+    description: "String with curly braces but no f-prefix - path not interpolated"
+
+  - name: "lit_null_string"
+    pattern: "lit\\(NULL\\)"
+    severity: "critical"
+    description: "lit(NULL) passes Python variable NULL (undefined) - use lit(None) or lit('NULL')"
+
+  - name: "octal_default_value"
+    pattern: "defaultValue\\s*=\\s*0\\d+"
+    severity: "critical"
+    description: "defaultValue with leading zero is interpreted as octal in Python"
+
+  - name: "col_substring_unclosed"
+    pattern: "col\\(SUBSTRING"
+    severity: "critical"
+    description: "col(SUBSTRING - likely unquoted SQL function inside col(), missing closing paren or quotes"
+
+  # ── High ────────────────────────────────────────────────────────────────────
+  - name: "current_timestamp_call"
+    pattern: "CurrentTimestamp\\(\\)"
+    severity: "high"
+    description: "CurrentTimestamp() is not a PySpark function - use current_timestamp()"
+
+  - name: "date_offset_by_components"
+    pattern: "DateOffsetByComponents"
+    severity: "high"
+    description: "DateOffsetByComponents is a DataStage function - needs PySpark equivalent"
+
+  - name: "isnotnull_isnull_capitalized"
+    pattern: "Is[Nn]ot[Nn]ull\\(\\)|Isnull\\(\\)"
+    severity: "high"
+    description: "IsNotNull()/Isnull() are DataStage functions - use isNotNull()/isNull() or col().isNotNull()"
+
+  - name: "strleft_strright"
+    pattern: "[Ss]tr[Ll]eft\\(\\)|[Ss]tr[Rr]ight\\(\\)"
+    severity: "high"
+    description: "strleft()/Right() are DataStage functions - use substring() in PySpark"
+
+  - name: "ereplace_function"
+    pattern: "[Ee]replace\\("
+    severity: "high"
+    description: "ereplace()/Ereplace() is a DataStage function - use regexp_replace() in PySpark"
+
+  - name: "wrong_dataframe_ref_conv"
+    pattern: "_CONV"
+    severity: "high"
+    description: "Wrong DataFrame reference (_CONV) - likely a stale BladeBridge conversion artifact"
+
+  - name: "missing_agg_on_groupby"
+    pattern: "\\.groupBy\\([^)]*\\)\\s*\\."
+    severity: "high"
+    description: "groupBy() without .agg() - may be missing aggregation call"
+    needs_review: true
+
+  - name: "sql_update_statement"
+    pattern: "spark\\.sql\\(.*UPDATE\\s"
+    severity: "high"
+    description: "SQL UPDATE in spark.sql() - Delta uses MERGE INTO, not UPDATE with joins"
+
+  - name: "iif_function"
+    pattern: "IIF\\("
+    severity: "high"
+    description: "IIF() is not a PySpark/SQL function - use when().otherwise() or CASE WHEN"
+
+  - name: "caret_exponentiation"
+    pattern: "\\^"
+    severity: "high"
+    description: "^ is XOR in Python/Spark SQL, not exponentiation - use pow() or ** instead"
+    needs_review: true
+
+  - name: "csv_empty_path"
+    pattern: "\\.csv\\(''\\)"
+    severity: "high"
+    description: ".csv('') with empty path - missing file path argument"
+
+  - name: "lit_varname_unquoted"
+    pattern: "lit\\([A-Za-z_][A-Za-z_0-9]*\\)"
+    severity: "high"
+    description: "lit(varName) without quotes - likely meant lit('varName') for a string literal"
+    needs_review: true
+
+  - name: "admin_cmd_runstats"
+    pattern: "ADMIN_CMD|RUNSTATS"
+    severity: "high"
+    description: "ADMIN_CMD/RUNSTATS are DB2 commands - not applicable on Databricks"
+
+  - name: "sync_ddl_refresh"
+    pattern: "SET SYNC_DDL|REFRESH"
+    severity: "high"
+    description: "SET SYNC_DDL/REFRESH are Impala/Hive commands - not needed on Databricks"
+    needs_review: true
+
+  - name: "if_then_else_in_expr"
+    pattern: "\\bIF\\b.*\\bTHEN\\b.*\\bELSE\\b"
+    severity: "high"
+    description: "IF/THEN/ELSE block in expression - use when().otherwise() in PySpark"
