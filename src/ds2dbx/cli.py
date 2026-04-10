@@ -268,8 +268,11 @@ def convert(
         from ds2dbx.passes.pass3_transpile import Pass3Transpile
         p3 = Pass3Transpile(cfg, out_dir, verbose)
         metrics = p3.run(manifest, force)
-        rate = metrics.get("conversion_rate", 0)
-        console.print(f"  [green]✓ Pass 3 complete[/green] — {rate:.0%} conversion rate")
+        clean = metrics.get("triage_clean", 0)
+        fixed = metrics.get("switch_fixed", 0)
+        failed = metrics.get("switch_failed", 0)
+        wf = metrics.get("bladebridge_workflows", 0)
+        console.print(f"  [green]✓ Pass 3 complete[/green] — {clean} clean + {fixed} fixed, {failed} manual, {wf} workflow(s)")
     elif 3 in pass_list:
         console.print("\n[yellow]Pass 3 (Transpile): Skipped — no Datastage/ folder[/yellow]")
 
@@ -425,34 +428,53 @@ def validate(
 
 @app.command()
 def deploy(
-    path: str = typer.Argument(..., help="Path to use case directory"),
+    path: str = typer.Argument(..., help="Path to use case directory or parent"),
     config: str = ConfigOption,
     profile: str = ProfileOption,
     verbose: bool = VerboseOption,
 ):
     """Deploy converted notebooks and workflows to workspace."""
     from ds2dbx.workspace.deploy import deploy_usecase
+    from ds2dbx.scanner.folder import discover_usecases
 
     cfg = _load_cfg(config, profile, None, None)
-    uc_path = Path(path).resolve()
-    out_dir = _get_output_dir(None, uc_path)
-    deploy_dir = out_dir / "deploy"
+    target = Path(path).resolve()
+    output_base = Path("_ds2dbx_output")
 
-    if not deploy_dir.exists():
-        console.print(f"[red]No deploy directory found at {deploy_dir}[/red]")
-        console.print("Run [bold]ds2dbx convert[/bold] first.")
+    # Discover use cases
+    if (target / "Shell").exists() or (target / "DDL").exists():
+        uc_paths = [target]
+    else:
+        uc_paths = discover_usecases(target)
+
+    if not uc_paths:
+        console.print(f"[red]No use cases found at {target}[/red]")
         raise typer.Exit(1)
 
-    ws_base = f"{cfg.get_workspace_base()}/{uc_path.name}"
-    console.print(f"\n[bold]Deploying to:[/bold] {ws_base}")
+    total_notebooks = 0
+    total_workflows = 0
 
-    metrics = deploy_usecase(deploy_dir, ws_base, cfg, verbose)
-    console.print(f"  Notebooks uploaded: {metrics['notebooks_uploaded']}")
-    console.print(f"  Workflows created: {metrics['workflows_created']}")
-    if metrics["workflow_ids"]:
-        host = cfg.get_host()
-        for jid in metrics["workflow_ids"]:
-            console.print(f"  Job URL: {host}/#job/{jid}")
+    for uc_path in uc_paths:
+        out_dir = output_base / uc_path.name
+
+        if not out_dir.exists():
+            console.print(f"\n[yellow]Skipping {uc_path.name} — not yet converted[/yellow]")
+            continue
+
+        ws_base = f"{cfg.get_workspace_base()}/{uc_path.name}"
+        console.print(f"\n[bold]Deploying: {uc_path.name}[/bold]")
+        console.print(f"  Target: {ws_base}")
+
+        metrics = deploy_usecase(out_dir, ws_base, cfg, verbose)
+        total_notebooks += metrics["notebooks_uploaded"]
+        total_workflows += metrics["workflows_created"]
+
+        console.print(
+            f"  [green]Done:[/green] {metrics['notebooks_uploaded']} notebook(s), "
+            f"{metrics['workflows_created']} workflow(s)"
+        )
+
+    console.print(f"\n[bold]Total:[/bold] {total_notebooks} notebooks, {total_workflows} workflows deployed")
 
 
 @app.command()
@@ -644,8 +666,9 @@ def status(
             fixed = p3.get("switch_fixed", 0)
             failed = p3.get("switch_failed", 0)
             wf = p3.get("bladebridge_workflows", 0)
+            total = clean + fixed + failed
             console.print(f"\n  {uc_path.name}:")
-            console.print(f"    Notebooks: {clean} clean + {fixed} fixed + {failed} manual = {rate:.0%}")
+            console.print(f"    Notebooks: {clean} clean + {fixed} fixed + {failed} manual ({total} total)")
             console.print(f"    Workflows: {wf}")
 
 

@@ -198,7 +198,33 @@ ds2dbx verify ./my_usecase/
 
 This compares source files against output — checks all tables present, columns match, DML preserved, infrastructure commands removed.
 
-### 6. Check status
+### 6. Deploy to workspace
+
+```bash
+ds2dbx deploy ./my_usecase/
+
+# Or deploy all use cases at once
+ds2dbx deploy ./
+```
+
+This uploads all converted notebooks to the workspace and creates Databricks Serverless Workflows from BladeBridge-generated job definitions (Pass 3). Each workflow preserves the original DataStage task dependencies — sequential jobs become task chains, parallel jobs fan into sequencer tasks.
+
+Example output:
+```
+Deploying: my_usecase
+  Uploading Pass 1 (DDL): 1 notebook(s)
+  Uploading Pass 2 (Data): 1 notebook(s)
+  Uploading Pass 3 (Transpile): 31 notebook(s)
+  Uploading Pass 4 (Shell): 2 notebook(s)
+  Uploading Pass 5 (Validate): 1 notebook(s)
+  Creating 10 workflow(s) + 1 orchestrator(s)
+    Created: SEQ_pipeline_A -> https://your-workspace.azuredatabricks.net/#job/12345
+    Created: SEQ_pipeline_B -> https://your-workspace.azuredatabricks.net/#job/12346
+    Created orchestrator: SEQ_MASTER -> https://your-workspace.azuredatabricks.net/#job/12347
+  Done: 36 notebook(s), 11 workflow(s)
+```
+
+### 7. Check status
 
 ```bash
 ds2dbx status ./
@@ -206,9 +232,9 @@ ds2dbx status ./
 
 ```
 ┃ Use Case              ┃ Pattern        ┃ P1 ┃ P2 ┃ P3 ┃ P4 ┃ P5 ┃
-│ UC1 - consent_master  │ multi_join     │ ✓  │ ✓  │ —  │ ✓  │ ✓  │
-│ UC2 - ip_document     │ scd2           │ ✓  │ ✓  │ —  │ ✓  │ ✓  │
-│ UC3 - cc_transactions │ file_ingestion │ ✓  │ ✓  │ —  │ ✓  │ ✓  │
+│ UC1 - pipeline_A      │ multi_join     │ ✓  │ ✓  │ ✓  │ ✓  │ ✓  │
+│ UC2 - pipeline_B      │ scd2           │ ✓  │ ✓  │ ✓  │ ✓  │ ✓  │
+│ UC3 - pipeline_C      │ file_ingestion │ ✓  │ ✓  │ ✓  │ ✓  │ ✓  │
 ```
 
 ---
