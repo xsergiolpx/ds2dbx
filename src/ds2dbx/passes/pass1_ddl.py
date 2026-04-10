@@ -20,8 +20,8 @@ console = Console()
 _HDFS_RE = re.compile(r"LOCATION\s+'hdfs://[^']*'", re.IGNORECASE)
 _STORED_AS_RE = re.compile(r"STORED\s+AS\s+\w+", re.IGNORECASE)
 _ROW_FORMAT_RE = re.compile(
-    r"ROW\s+FORMAT\s+DELIMITED.*?(?=\)|;|\n\n|\bCREATE\b|\bALTER\b)",
-    re.IGNORECASE | re.DOTALL,
+    r"^ROW\s+FORMAT\s+DELIMITED[^\n]*(?:\n(?!(?:CREATE|ALTER|spark\.sql|\)|#|$)).*)*",
+    re.IGNORECASE | re.MULTILINE,
 )
 _KUDU_TBLPROPS_RE = re.compile(
     r"TBLPROPERTIES\s*\([^)]*kudu[^)]*\)", re.IGNORECASE | re.DOTALL
