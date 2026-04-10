@@ -71,6 +71,17 @@ def create_workflow(
             nb_name = Path(nb_task["notebook_path"]).name
             nb_task["notebook_path"] = f"{ws_notebooks_path}/{nb_name}"
 
+        # Convert spark_python_task to notebook_task (Serverless compatible)
+        sp_task = task.get("spark_python_task", {})
+        if "python_file" in sp_task:
+            py_file = sp_task["python_file"]
+            py_name = Path(py_file).stem  # Remove .py extension for notebook path
+            task.pop("spark_python_task")
+            task["notebook_task"] = {
+                "notebook_path": f"{ws_notebooks_path}/{py_name}",
+                "source": "WORKSPACE",
+            }
+
     # Remove job_clusters (Serverless doesn't need them) and add environments
     workflow.pop("job_clusters", None)
     workflow["environments"] = [
