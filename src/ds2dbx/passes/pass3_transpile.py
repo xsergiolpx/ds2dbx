@@ -147,19 +147,22 @@ class Pass3Transpile(BasePass):
 
             # --- Step 8: Post-process notebooks and workflow JSON ---
         notebooks_fixed = 0
+        # Collect source files from manifest for delimiter detection
+        source_files = [Path(p) for p in manifest.source_files] if hasattr(manifest, 'source_files') else []
         for nb in merged_dir.glob("*.py"):
             if _post_process_notebook(
                 nb,
                 catalog=self.config.catalog,
                 source_schema=self.config.get_source_schema(),
                 target_schema=self.config.get_target_schema(),
+                source_files=source_files,
             ):
                 notebooks_fixed += 1
         if notebooks_fixed:
             console.print(f"  Post-processed {notebooks_fixed} notebook(s)")
 
         for wf in merged_dir.glob("*.json"):
-            _post_process_workflow(wf)
+            _post_process_workflow(wf, source_files=source_files)
 
         total_input = len(manifest.datastage_files)
         total_output = len(list(merged_dir.glob("*.py")))
@@ -194,7 +197,13 @@ _SUBSTRINGS_RE = re.compile(r'\bSubstrings\s*\(', re.IGNORECASE)
 _FSTRING_VAR_RE = re.compile(r'\{([A-Z_][A-Z0-9_]*)\}')
 
 
-def _post_process_notebook(nb_path: Path, catalog: str = "", source_schema: str = "", target_schema: str = "") -> bool:
+def _post_process_notebook(
+    nb_path: Path,
+    catalog: str = "",
+    source_schema: str = "",
+    target_schema: str = "",
+    source_files: list[Path] | None = None,
+) -> bool:
     """Fix common BladeBridge issues in generated notebooks.
 
     Returns True if the notebook was modified.
@@ -257,7 +266,29 @@ def _post_process_notebook(nb_path: Path, catalog: str = "", source_schema: str 
     # Convert these to actual Python/Spark expressions.
     content = _fix_uservar_todo_expressions(content)
 
-    # --- Fix 8: RCNCL notebooks read from target_schema, not source_schema ---
+    # --- Fix 8b: Drop table before overwrite to prevent schema merge conflicts ---
+    # When DDL creates a table with lowercase columns but the notebook writes uppercase,
+    # Delta can't merge the schemas. Add DROP TABLE before mode('overwrite').saveAsTable.
+    if "mode('overwrite')" in content or 'mode("overwrite")' in content:
+        def _add_drop_before_write(m: re.Match) -> str:
+            var = m.group(1)
+            target_expr = m.group(3)
+            # Build the DROP TABLE expression using the same target ref
+            drop_line = f'_tbl = {target_expr}\nspark.sql(f"DROP TABLE IF EXISTS {{_tbl}}")'
+            return f'{drop_line}\n{var}.write.mode("overwrite").saveAsTable({target_expr})'
+        content = re.sub(
+            r"""(\w+)\.write\.mode\(['"](overwrite)['"]\)\.saveAsTable\(([^)]+)\)""",
+            _add_drop_before_write,
+            content,
+        )
+
+    # --- Fix 9: Mainframe file delimiter + schema + header filtering ---
+    # When a notebook reads a CSV from Volumes and has a .toDF() with many columns,
+    # it's a mainframe file ingestion pattern. Fix the delimiter, add explicit schema,
+    # and filter header/trailer rows.
+    content = _fix_mainframe_file_read(content, source_files or [])
+
+    # --- Fix 10: RCNCL notebooks read from target_schema, not source_schema ---
     # RCNCL reconciles target tables. The LLM sometimes puts source_schema in
     # FROM clauses, but RCNCL reads from target_schema.
     if "RCNCL_TRG" in nb_path.name and target_schema and source_schema:
@@ -809,7 +840,136 @@ def _fix_uservar_todo_expressions(content: str) -> str:
     return "\n".join(new_lines)
 
 
-def _post_process_workflow(wf_path: Path) -> None:
+def _fix_mainframe_file_read(content: str, source_files: list[Path]) -> str:
+    """Fix mainframe file ingestion: delimiter, explicit schema, header filter.
+
+    Detects notebooks that read a CSV from Volumes and have many column aliases
+    (either via .toDF() or .select(col("_c0").alias(...))). Fixes:
+    1. Delimiter — detect from actual source file
+    2. Schema — add explicit StructType so header rows don't break column count
+    3. Header filter — filter rows where a key column is null/empty
+    """
+    if ".csv(" not in content:
+        return content
+
+    # --- Detect column names from .toDF() or _c* alias patterns ---
+    col_names: list[str] = []
+
+    # Pattern 1: .toDF("col1", "col2", ...)
+    todf_match = re.search(r'(\w+)\s*=\s*(\w+)\.toDF\(\s*\n?(.*?)\)', content, re.DOTALL)
+    if todf_match:
+        col_names = re.findall(r'"([^"]+)"', todf_match.group(3))
+
+    # Pattern 2: .select(col("_c0").alias("COL1"), ...) or col('_c0').alias(...)
+    if not col_names:
+        c_aliases = re.findall(r"col\(['\"]_c\d+['\"]\)\.alias\(['\"]([^'\"]+)['\"]\)", content)
+        if len(c_aliases) >= 5:
+            col_names = c_aliases
+
+    # Pattern 3: Comments mapping _c* to column names (LLM puts mapping in comments)
+    if not col_names:
+        comment_mapping = re.findall(r'#\s*_c\d+\s*=\s*(\w+)', content)
+        if len(comment_mapping) >= 5:
+            col_names = comment_mapping
+
+    if len(col_names) < 5:
+        return content  # Not a mainframe file pattern
+
+    # --- Detect delimiter from source file ---
+    detected_sep = "|"  # default for mainframe
+    for sf in source_files:
+        if sf.exists():
+            try:
+                lines = sf.read_text(encoding="utf-8", errors="replace").splitlines()
+                max_fields = 0
+                for line in lines[1:5]:
+                    for sep in ["|", "\t", ",", ";"]:
+                        nf = len(line.split(sep))
+                        if nf > max_fields:
+                            max_fields = nf
+                            detected_sep = sep
+                break
+            except Exception:
+                pass
+
+    # --- Fix delimiter in .option("sep", ...) ---
+    content = re.sub(
+        r'\.option\(\s*"sep"\s*,\s*"[^"]*"\s*\)',
+        f'.option("sep", "{detected_sep}")',
+        content,
+    )
+
+    # --- Add explicit StructType schema to CSV read ---
+    # This ensures Spark reads the correct number of columns even when
+    # the header/trailer row has fewer fields.
+    schema_import = 'from pyspark.sql.types import StructType, StructField, StringType'
+    col_list_str = ", ".join(f'"{c}"' for c in col_names)
+    schema_def = (
+        f'{schema_import}\n'
+        f'_col_names = [{col_list_str}]\n'
+        f'_schema = StructType([StructField(c, StringType(), True) for c in _col_names])'
+    )
+
+    # Insert schema before the csv read and add .schema(_schema)
+    csv_read_re = re.compile(
+        r'(\w+)\s*=\s*spark\.read'
+        r'\.option\("header"\s*,\s*"false"\)'
+        r'\.option\("sep"\s*,\s*"[^"]*"\)'
+        r'\.csv\(',
+    )
+    csv_m = csv_read_re.search(content)
+    if csv_m:
+        var_name = csv_m.group(1)
+        # Insert schema definition before the read
+        content = content[:csv_m.start()] + schema_def + "\n" + content[csv_m.start():]
+        # Re-find after insertion
+        csv_m = csv_read_re.search(content)
+        if csv_m:
+            # Add .schema(_schema) before .csv(
+            old = csv_m.group(0)
+            new = old.replace('.csv(', '.schema(_schema).csv(')
+            content = content.replace(old, new, 1)
+
+    # --- Replace .toDF() or _c* select with named columns from schema ---
+    if todf_match:
+        # Remove the .toDF() call
+        content = re.sub(
+            r'\w+\s*=\s*\w+\.toDF\([^)]*\)',
+            '# Column names applied via schema at read time',
+            content,
+        )
+    else:
+        # Replace all _c* column references with named columns from schema
+        # Handles: col("_c0"), col('_c0'), etc.
+        for i, name in enumerate(col_names):
+            content = re.sub(
+                rf"""col\(['"]{re.escape(f'_c{i}')}'?\)""",
+                f"col('{name}')",
+                content,
+            )
+
+    # --- Add header/trailer filter after the CSV read ---
+    # Use the first column (typically ORG code like "001") to identify data rows.
+    # Header/trailer rows have "000" in the first column while data rows have "001"+.
+    # Filter: first column must not be "000" or null/empty.
+    var_name = csv_m.group(1) if csv_m else "DSLink2"
+    first_col = col_names[0]
+    filter_line = (
+        f'\n# Filter out header/trailer rows (mainframe control records)\n'
+        f'{var_name} = {var_name}'
+        f'.filter((col("{first_col}") != "000") & col("{first_col}").isNotNull())'
+    )
+
+    # Insert filter after the csv read closing paren
+    csv_close = re.search(r'\.schema\(_schema\)\.csv\([^)]*\)', content)
+    if csv_close:
+        insert_pos = csv_close.end()
+        content = content[:insert_pos] + filter_line + content[insert_pos:]
+
+    return content
+
+
+def _post_process_workflow(wf_path: Path, source_files: list[Path] | None = None) -> None:
     """Remove existing_cluster_id, add environment_key, and fix base_parameters."""
     try:
         data = json.loads(wf_path.read_text(encoding="utf-8"))
@@ -924,10 +1084,41 @@ def _post_process_workflow(wf_path: Path) -> None:
             param["default"] = default[1:-1]
             modified = True
 
+    # Fix D: Derive POS_DT default from source file date suffix.
+    # Source files like CPACP.DIH.KB1DH007.CPAHF.D010426 encode the date as DDMMYY.
+    # Convert to YYYY-MM-DD and set as POS_DT default so the workflow finds the file.
+    if source_files:
+        for param in data.get("parameters", []):
+            if param.get("name") == "POS_DT":
+                for sf in (source_files or []):
+                    m = re.search(r'\.D(\d{2})(\d{2})(\d{2})$', sf.name)
+                    if m:
+                        dd, mm, yy = m.group(1), m.group(2), m.group(3)
+                        year = f"20{yy}"
+                        new_date = f"{year}-{mm}-{dd}"
+                        if param.get("default") != new_date:
+                            param["default"] = new_date
+                            modified = True
+                        break
+
     for task in tasks:
         if "existing_cluster_id" in task:
             del task["existing_cluster_id"]
             modified = True
+
+        # Convert spark_python_task → notebook_task (Serverless compatibility)
+        # BladeBridge generates spark_python_task with %TASK_PATH% placeholders
+        sp_task = task.get("spark_python_task", {})
+        if "python_file" in sp_task:
+            py_file = sp_task["python_file"]
+            nb_name = Path(py_file).stem
+            task.pop("spark_python_task")
+            task["notebook_task"] = {
+                "notebook_path": f"/Workspace/Users/{nb_name}",
+                "source": "WORKSPACE",
+            }
+            modified = True
+
         if "job_cluster_key" not in task and "environment_key" not in task:
             task["environment_key"] = "default"
             modified = True
