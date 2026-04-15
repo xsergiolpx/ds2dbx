@@ -215,24 +215,37 @@ def convert(
         console.print("\n[bold]Lakebridge commands that would be executed:[/bold]")
         lb = cfg.lakebridge
         ws_base = cfg.get_workspace_base()
+        prompt_base = f"/Workspace/Users/{{username}}/.lakebridge/switch/resources/custom_prompts"
         if manifest.ddl_files and 1 in [int(p.strip()) for p in passes.split(",")]:
             ws_out = f"{ws_base}/{manifest.name}/pass1_ddl"
-            console.print(f"  [dim]Pass 1:[/dim] databricks labs lakebridge llm-transpile "
-                          f"--input-source <local> --output-ws-folder {ws_out} "
-                          f"--foundation-model {lb.foundation_model}")
+            console.print(f"  [dim]Pass 1 (DDL → Switch):[/dim]")
+            console.print(f"    Custom prompt: {prompt_base}/switch_ddl_prompt.yml")
+            console.print(f"    switch_config: source_format=sql, max_fix_attempts={lb.max_fix_attempts}, concurrency={lb.concurrency}")
+            console.print(f"    databricks labs lakebridge llm-transpile \\")
+            console.print(f"      --input-source <local> --output-ws-folder {ws_out} \\")
+            console.print(f"      --foundation-model {lb.foundation_model}")
         if manifest.datastage_files and 3 in [int(p.strip()) for p in passes.split(",")]:
-            console.print(f"  [dim]Pass 3 (BladeBridge):[/dim] databricks labs lakebridge transpile "
-                          f"--input-source <local> --output-folder <local> "
-                          f"--source-dialect datastage --target-technology PYSPARK")
+            console.print(f"  [dim]Pass 3a (DataStage XML → BladeBridge):[/dim]")
+            console.print(f"    databricks labs lakebridge transpile \\")
+            console.print(f"      --input-source <local> --output-folder <local> \\")
+            console.print(f"      --source-dialect datastage --target-technology PYSPARK")
+            console.print(f"  [dim]Pass 3b (Triage → classify clean vs broken)[/dim]")
             ws_out = f"{ws_base}/{manifest.name}/pass3_switch"
-            console.print(f"  [dim]Pass 3 (Switch):[/dim] databricks labs lakebridge llm-transpile "
-                          f"--input-source <local> --output-ws-folder {ws_out} "
-                          f"--foundation-model {lb.foundation_model}")
+            console.print(f"  [dim]Pass 3c (Broken notebooks → Switch):[/dim]")
+            console.print(f"    Custom prompt: ds2dbx/prompts/datastage_fix_prompt.yml (30 bug patterns)")
+            console.print(f"    switch_config: source_format=databricks, max_fix_attempts={lb.max_fix_attempts}, concurrency={lb.concurrency}")
+            console.print(f"    databricks labs lakebridge llm-transpile \\")
+            console.print(f"      --input-source <local> --output-ws-folder {ws_out} \\")
+            console.print(f"      --foundation-model {lb.foundation_model}")
+            console.print(f"  [dim]Pass 3d (Post-processing → 10 deterministic notebook fixes + 5 workflow fixes)[/dim]")
         if manifest.shell_logic_scripts and 4 in [int(p.strip()) for p in passes.split(",")]:
             ws_out = f"{ws_base}/{manifest.name}/pass4_shell"
-            console.print(f"  [dim]Pass 4:[/dim] databricks labs lakebridge llm-transpile "
-                          f"--input-source <local> --output-ws-folder {ws_out} "
-                          f"--foundation-model {lb.foundation_model}")
+            console.print(f"  [dim]Pass 4 (Shell → Switch):[/dim]")
+            console.print(f"    Custom prompt: {prompt_base}/switch_shell_prompt.yml")
+            console.print(f"    switch_config: source_format=generic, max_fix_attempts={lb.max_fix_attempts}, concurrency={lb.concurrency}")
+            console.print(f"    databricks labs lakebridge llm-transpile \\")
+            console.print(f"      --input-source <local> --output-ws-folder {ws_out} \\")
+            console.print(f"      --foundation-model {lb.foundation_model}")
         return
 
     # Save manifest
