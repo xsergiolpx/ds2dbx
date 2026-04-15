@@ -109,6 +109,10 @@ class SwitchRunner:
             "--profile", self.profile,
         ]
 
+        # Display the command being executed
+        cmd_display = " \\\n    ".join(cmd)
+        console.print(f"  [dim]$ {cmd_display}[/dim]")
+
         result = run_command(
             cmd,
             verbose=self.verbose,

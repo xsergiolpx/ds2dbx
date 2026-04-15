@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from rich.console import Console
+
 from ds2dbx.config import Config
 from ds2dbx.utils.subprocess_runner import RunResult, run_command
+
+console = Console()
 
 
 class BladeBridgeRunner:
@@ -39,6 +43,9 @@ class BladeBridgeRunner:
             "--skip-validation", "true",
             "--profile", self.profile,
         ]
+
+        cmd_display = " \\\n    ".join(cmd)
+        console.print(f"  [dim]$ {cmd_display}[/dim]")
 
         return run_command(
             cmd,
