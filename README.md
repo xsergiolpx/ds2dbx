@@ -209,19 +209,44 @@ ds2dbx deploy ./
 
 This uploads all converted notebooks to the workspace and creates Databricks Serverless Workflows from BladeBridge-generated job definitions (Pass 3). Each workflow preserves the original DataStage task dependencies — sequential jobs become task chains, parallel jobs fan into sequencer tasks.
 
+### 6b. Deploy with prerequisites (recommended for first run)
+
+```bash
+# Deploy + create schema/tables/data + source views
+ds2dbx deploy ./my_usecase/ --run-prereqs --cluster-id <YOUR_CLUSTER_ID>
+
+# Auto-detect a running cluster
+ds2dbx deploy ./my_usecase/ --run-prereqs
+```
+
+With `--run-prereqs`, the tool also:
+- Creates the target schema (`CREATE SCHEMA IF NOT EXISTS`)
+- Creates a volume for source files (`CREATE VOLUME IF NOT EXISTS`)
+- Uploads source files (mainframe extracts, etc.) to the volume
+- Runs the DDL notebook on the cluster (creates target tables)
+- Runs the data loader notebook on the cluster (loads sample CSV data)
+- Auto-detects missing source tables and creates views pointing to loaded data
+
+This makes workflow execution self-contained — all tables, data, and views are ready before workflows run.
+
 Example output:
 ```
 Deploying: my_usecase
   Uploading Pass 1 (DDL): 1 notebook(s)
-  Uploading Pass 2 (Data): 1 notebook(s)
   Uploading Pass 3 (Transpile): 31 notebook(s)
-  Uploading Pass 4 (Shell): 2 notebook(s)
-  Uploading Pass 5 (Validate): 1 notebook(s)
   Creating 10 workflow(s) + 1 orchestrator(s)
     Created: SEQ_pipeline_A -> https://your-workspace.azuredatabricks.net/#job/12345
-    Created: SEQ_pipeline_B -> https://your-workspace.azuredatabricks.net/#job/12346
     Created orchestrator: SEQ_MASTER -> https://your-workspace.azuredatabricks.net/#job/12347
   Done: 36 notebook(s), 11 workflow(s)
+
+  Running prerequisites on cluster 0714-073622-xr9f5da2...
+  Creating schema catalog.schema...
+  Creating volume catalog.schema.data...
+  Running DDL notebook: all_ddl...
+  Running data loader: my_usecase_data_loader...
+  Creating 1 source view(s)...
+    Creating catalog.schema.V_SOURCE_VIEW
+  Setup: schema=True, volume=True, DDL=OK, data=OK, views=1
 ```
 
 ### 7. Check status
@@ -254,6 +279,7 @@ ds2dbx status ./
 | `ds2dbx validate <path>` | Pass 5 only — generate validation notebook |
 | `ds2dbx verify <path>` | Verify conversion output against source files |
 | `ds2dbx deploy <path>` | Upload notebooks + create Serverless Workflows |
+| `ds2dbx deploy <path> --run-prereqs` | Deploy + create schema/tables/data/views on cluster |
 | `ds2dbx status <path>` | Show conversion summary table |
 
 ### Common flags

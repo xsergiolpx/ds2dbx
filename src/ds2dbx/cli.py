@@ -74,10 +74,11 @@ def init(
     console.print("[bold]1. Databricks connection[/bold]")
     profile = typer.prompt("  CLI profile", default="DEFAULT")
 
-    # --- Target catalog & schema ---
-    console.print("\n[bold]2. Target catalog & schema[/bold] (where converted tables will be created)")
-    catalog = typer.prompt("  Unity Catalog name", default="migration_pilot")
-    schema = typer.prompt("  Schema name", default="converted")
+    # --- Catalog & schemas ---
+    console.print("\n[bold]2. Unity Catalog & schemas[/bold]")
+    catalog = typer.prompt("  Catalog name", default="migration_pilot")
+    source_schema = typer.prompt("  Source schema (where input/source data is loaded)", default="source")
+    target_schema = typer.prompt("  Target schema (where converted output tables go)", default="target")
 
     # --- Lakebridge settings ---
     console.print("\n[bold]3. Lakebridge Switch settings[/bold]")
@@ -91,7 +92,8 @@ def init(
     cfg = Config()
     cfg.databricks.profile = profile
     cfg.catalog = catalog
-    cfg.schema = schema
+    cfg.source_schema = source_schema
+    cfg.target_schema = target_schema
     cfg.lakebridge.switch_catalog = switch_catalog
     cfg.lakebridge.switch_schema = switch_schema
     cfg.lakebridge.switch_volume = switch_volume
@@ -210,6 +212,27 @@ def convert(
 
     if dry_run:
         console.print("\n[yellow]Dry run — no passes executed.[/yellow]")
+        console.print("\n[bold]Lakebridge commands that would be executed:[/bold]")
+        lb = cfg.lakebridge
+        ws_base = cfg.get_workspace_base()
+        if manifest.ddl_files and 1 in [int(p.strip()) for p in passes.split(",")]:
+            ws_out = f"{ws_base}/{manifest.name}/pass1_ddl"
+            console.print(f"  [dim]Pass 1:[/dim] databricks labs lakebridge llm-transpile "
+                          f"--input-source <local> --output-ws-folder {ws_out} "
+                          f"--foundation-model {lb.foundation_model}")
+        if manifest.datastage_files and 3 in [int(p.strip()) for p in passes.split(",")]:
+            console.print(f"  [dim]Pass 3 (BladeBridge):[/dim] databricks labs lakebridge transpile "
+                          f"--input-source <local> --output-folder <local> "
+                          f"--source-dialect datastage --target-technology PYSPARK")
+            ws_out = f"{ws_base}/{manifest.name}/pass3_switch"
+            console.print(f"  [dim]Pass 3 (Switch):[/dim] databricks labs lakebridge llm-transpile "
+                          f"--input-source <local> --output-ws-folder {ws_out} "
+                          f"--foundation-model {lb.foundation_model}")
+        if manifest.shell_logic_scripts and 4 in [int(p.strip()) for p in passes.split(",")]:
+            ws_out = f"{ws_base}/{manifest.name}/pass4_shell"
+            console.print(f"  [dim]Pass 4:[/dim] databricks labs lakebridge llm-transpile "
+                          f"--input-source <local> --output-ws-folder {ws_out} "
+                          f"--foundation-model {lb.foundation_model}")
         return
 
     # Save manifest
@@ -432,8 +455,14 @@ def deploy(
     config: str = ConfigOption,
     profile: str = ProfileOption,
     verbose: bool = VerboseOption,
+    run_prereqs: bool = typer.Option(False, "--run-prereqs", help="Run DDL + data loader on cluster before deploying workflows"),
+    cluster_id: str = typer.Option("", "--cluster-id", help="Cluster ID for running prerequisite notebooks"),
 ):
-    """Deploy converted notebooks and workflows to workspace."""
+    """Deploy converted notebooks and workflows to workspace.
+
+    With --run-prereqs, also creates schema/volume, runs DDL and data loader
+    notebooks on a cluster, and creates source views for missing tables.
+    """
     from ds2dbx.workspace.deploy import deploy_usecase
     from ds2dbx.scanner.folder import discover_usecases
 
@@ -450,6 +479,14 @@ def deploy(
     if not uc_paths:
         console.print(f"[red]No use cases found at {target}[/red]")
         raise typer.Exit(1)
+
+    # Find cluster if --run-prereqs but no --cluster-id
+    if run_prereqs and not cluster_id:
+        cluster_id = _find_cluster(cfg)
+        if not cluster_id:
+            console.print("[red]--run-prereqs requires a running cluster. Provide --cluster-id or start a cluster.[/red]")
+            raise typer.Exit(1)
+        console.print(f"Using cluster: {cluster_id}")
 
     total_notebooks = 0
     total_workflows = 0
@@ -474,7 +511,42 @@ def deploy(
             f"{metrics['workflows_created']} workflow(s)"
         )
 
+        # --- Run prerequisites if requested ---
+        if run_prereqs:
+            console.print(f"\n  [bold]Running prerequisites on cluster {cluster_id}...[/bold]")
+            from ds2dbx.workspace.setup import run_setup
+            setup_metrics = run_setup(out_dir, cfg, cluster_id, verbose)
+            console.print(
+                f"  [green]Setup:[/green] schema={setup_metrics['schema_created']}, "
+                f"volume={setup_metrics['volume_created']}, "
+                f"DDL={'OK' if setup_metrics['ddl_notebook_run'] else 'SKIP'}, "
+                f"data={'OK' if setup_metrics['data_loader_run'] else 'SKIP'}, "
+                f"views={setup_metrics['source_views_created']}"
+            )
+
     console.print(f"\n[bold]Total:[/bold] {total_notebooks} notebooks, {total_workflows} workflows deployed")
+
+
+def _find_cluster(cfg: Config) -> str:
+    """Find a running cluster from the workspace."""
+    host = cfg.get_host()
+    token = cfg.get_token()
+    if not host or not token:
+        return ""
+    try:
+        import requests
+        resp = requests.get(
+            f"{host}/api/2.0/clusters/list",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            for c in resp.json().get("clusters", []):
+                if c.get("state") == "RUNNING":
+                    return c["cluster_id"]
+    except Exception:
+        pass
+    return ""
 
 
 @app.command()
@@ -525,7 +597,7 @@ def verify(
             for nb in ddl_notebooks:
                 ddl_issues = verify_ddl(
                     manifest.ddl_files, nb,
-                    catalog=cfg.catalog, schema=cfg.schema,
+                    catalog=cfg.catalog, schema=cfg.get_target_schema(),
                 )
                 for issue in ddl_issues:
                     if issue.severity == "error":

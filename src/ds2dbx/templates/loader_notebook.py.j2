@@ -26,17 +26,17 @@ spark.sql("USE SCHEMA {{ schema }}")
 
 # COMMAND ----------
 
-df_{{ table.table_name }} = (
+df = (
     spark.read
     .option("header", "{{ 'true' if table.has_header else 'false' }}")
     .option("inferSchema", "true")
     .option("sep", "{{ table.delimiter }}")
-    .csv("{{ volume_path }}/{{ table.filename }}")
+    .csv("{{ table.file_path }}")
 )
-print(f"{{ table.table_name }}: {df_{{ table.table_name }}.count()} rows, {len(df_{{ table.table_name }}.columns)} columns")
-df_{{ table.table_name }}.write.mode("overwrite").saveAsTable("{{ catalog }}.{{ schema }}.{{ table.table_name }}")
-{% endfor %}
+print("{{ table.table_name }}: " + str(df.count()) + " rows, " + str(len(df.columns)) + " columns")
+df.write.mode("overwrite").saveAsTable("{{ catalog }}.{{ schema }}.{{ table.table_name }}")
 
+{% endfor %}
 # COMMAND ----------
 
 # MAGIC %md
@@ -46,7 +46,7 @@ df_{{ table.table_name }}.write.mode("overwrite").saveAsTable("{{ catalog }}.{{ 
 
 print("=== Loaded Tables ===")
 {% for table in tables %}
-count_{{ table.table_name }} = spark.sql("SELECT COUNT(*) AS cnt FROM {{ catalog }}.{{ schema }}.{{ table.table_name }}").collect()[0]["cnt"]
-print(f"{{ table.table_name }}: {count_{{ table.table_name }}} rows")
+cnt = spark.sql("SELECT COUNT(*) AS cnt FROM {{ catalog }}.{{ schema }}.{{ table.table_name }}").collect()[0]["cnt"]
+print("{{ table.table_name }}: " + str(cnt) + " rows")
 {% endfor %}
 print("=== Done ===")

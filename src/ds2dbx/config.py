@@ -61,12 +61,20 @@ class DataLoadingConfig:
 class Config:
     databricks: DatabricksConfig = field(default_factory=DatabricksConfig)
     catalog: str = "migration_pilot"
-    schema: str = "converted"
+    schema: str = "converted"  # legacy single-schema (fallback for source/target)
+    source_schema: str = ""
+    target_schema: str = ""
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     lakebridge: LakebridgeConfig = field(default_factory=LakebridgeConfig)
     prompts: PromptsConfig = field(default_factory=PromptsConfig)
     shell_scripts: ShellScriptsConfig = field(default_factory=ShellScriptsConfig)
     data_loading: DataLoadingConfig = field(default_factory=DataLoadingConfig)
+
+    def get_source_schema(self) -> str:
+        return self.source_schema or self.schema
+
+    def get_target_schema(self) -> str:
+        return self.target_schema or self.schema
 
     def get_workspace_base(self) -> str:
         username = self._get_username()

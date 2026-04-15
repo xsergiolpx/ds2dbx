@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import requests
@@ -70,6 +71,11 @@ def create_workflow(
         if "notebook_path" in nb_task:
             nb_name = Path(nb_task["notebook_path"]).name
             nb_task["notebook_path"] = f"{ws_notebooks_path}/{nb_name}"
+
+        # Fix base_parameters: strip BladeBridge quotes and task value syntax
+        bp = nb_task.get("base_parameters", {})
+        if bp:
+            nb_task["base_parameters"] = _fix_base_parameters(bp)
 
         # Convert spark_python_task to notebook_task (Serverless compatible)
         sp_task = task.get("spark_python_task", {})
@@ -204,6 +210,132 @@ def create_master_workflow(
     return None
 
 
+# --- base_parameters fix helpers ---
+# Pattern: TaskName.PARAM (BladeBridge task value reference)
+_TASK_VALUE_RE = re.compile(r'(\w+)\.(\w+)')
+# Pattern: TaskName.{{job.parameters.PARAM}}
+_MIXED_JOB_PARAM_RE = re.compile(r'\w+\.\{\{(job\.parameters\.\w+)\}\}')
+
+
+def _fix_base_parameters(bp: dict) -> dict:
+    """Fix BladeBridge base_parameters to valid Databricks syntax."""
+    fixed = {}
+    for key, val in bp.items():
+        if not isinstance(val, str) or not val:
+            fixed[key] = val
+            continue
+        fixed[key] = _fix_param_value(val)
+    return fixed
+
+
+def _fix_param_value(val: str) -> str:
+    """Convert a BladeBridge parameter value to Databricks syntax."""
+    val = val.strip()
+    if re.match(r"^'[^']*'$", val):
+        return val[1:-1]
+    if val.startswith("{{") and val.endswith("}}"):
+        return val
+    if val.startswith("'{{") and val.endswith("}}'"):
+        return val[1:-1]
+    if _MIXED_JOB_PARAM_RE.fullmatch(val):
+        m = _MIXED_JOB_PARAM_RE.fullmatch(val)
+        return "{{" + m.group(1) + "}}"
+    if "+" in val:
+        parts = [p.strip() for p in val.split("+")]
+        result = []
+        for part in parts:
+            if re.match(r"^'[^']*'$", part):
+                result.append(part[1:-1])
+            elif _MIXED_JOB_PARAM_RE.fullmatch(part):
+                m = _MIXED_JOB_PARAM_RE.fullmatch(part)
+                result.append("{{" + m.group(1) + "}}")
+            elif _TASK_VALUE_RE.fullmatch(part):
+                m = _TASK_VALUE_RE.fullmatch(part)
+                result.append("{{" + f"tasks.{m.group(1)}.values.{m.group(2)}" + "}}")
+            else:
+                result.append(part)
+        return "".join(result)
+    m = _TASK_VALUE_RE.fullmatch(val)
+    if m:
+        task_name, param = m.group(1), m.group(2)
+        return "{{" + f"tasks.{task_name}.values.{param}" + "}}"
+    return val
+
+
+def _fix_widget_case_mismatches(output_dir: Path) -> None:
+    """Fix widget name case mismatches between workflow JSON and notebooks.
+
+    BladeBridge workflow JSON uses uppercase parameter names (TBL_CRN),
+    but Switch LLM may lowercase them in notebooks (tbl_crn).
+    This scans workflows for base_parameters, finds the corresponding notebooks,
+    and fixes any case-insensitive matches.
+    """
+    # Collect all parameter names from workflow JSONs
+    param_names_per_notebook: dict[str, set[str]] = {}  # notebook_stem -> {PARAM_NAMES}
+    wf_dirs = [
+        output_dir / "pass3_transpile" / "merged",
+        output_dir / "pass3_transpile" / "bladebridge_output",
+    ]
+    for wf_dir in wf_dirs:
+        if not wf_dir.exists():
+            continue
+        for wf_file in wf_dir.glob("*.json"):
+            try:
+                with open(wf_file) as f:
+                    wf = json.load(f)
+                for task in wf.get("tasks", []):
+                    nb_task = task.get("notebook_task", {})
+                    nb_path = nb_task.get("notebook_path", "")
+                    bp = nb_task.get("base_parameters", {})
+                    if nb_path and bp:
+                        nb_stem = Path(nb_path).name
+                        param_names_per_notebook.setdefault(nb_stem, set()).update(bp.keys())
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    if not param_names_per_notebook:
+        return
+
+    # Scan notebooks in all output dirs and fix case mismatches
+    notebook_dirs = [
+        output_dir / "pass3_transpile" / "merged",
+        output_dir / "pass4_shell" / "output",
+    ]
+    for nb_dir in notebook_dirs:
+        if not nb_dir.exists():
+            continue
+        for nb_file in nb_dir.glob("*.py"):
+            expected_params = param_names_per_notebook.get(nb_file.stem, set())
+            if not expected_params:
+                continue
+            content = nb_file.read_text(encoding="utf-8", errors="replace")
+            new_content = content
+            for param in expected_params:
+                # Check if notebook uses a different case version
+                param_lower = param.lower()
+                # Fix widget definitions: dbutils.widgets.text("tbl_crn", ...) -> dbutils.widgets.text("TBL_CRN", ...)
+                pattern = re.compile(
+                    rf'(dbutils\.widgets\.\w+\(\s*["\'])({re.escape(param_lower)})(["\'])',
+                    re.IGNORECASE,
+                )
+                for m in pattern.finditer(new_content):
+                    if m.group(2) != param:  # Case mismatch
+                        new_content = new_content[:m.start(2)] + param + new_content[m.end(2):]
+                # Fix variable assignments: tbl_crn = dbutils.widgets.get("tbl_crn") -> TBL_CRN = ...
+                # And variable usages
+                wrong_case = param_lower
+                if wrong_case != param and wrong_case in new_content:
+                    # Only replace whole-word matches of the wrong-cased variable
+                    new_content = re.sub(
+                        rf'\b{re.escape(wrong_case)}\b',
+                        param,
+                        new_content,
+                    )
+
+            if new_content != content:
+                nb_file.write_text(new_content, encoding="utf-8")
+
+
 def deploy_usecase(
     output_dir: Path,
     ws_base_path: str,
@@ -246,6 +378,9 @@ def deploy_usecase(
          "--profile", config.databricks.profile],
         verbose=verbose,
     )
+
+    # --- Step 0: Fix widget name case mismatches between workflows and notebooks ---
+    _fix_widget_case_mismatches(output_dir)
 
     # --- Step 1: Upload notebooks from all passes ---
     pass_dirs = [

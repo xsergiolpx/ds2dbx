@@ -31,7 +31,7 @@ system_message: |
   ### 4. PySpark API Misuse
   - **Bug 18:** Chained `.withColumn("a", ...).withColumn("b", ...)` on 50+ columns — refactor to `df.select([...])` with aliased expressions for performance
   - **Bug 19:** `.option("sep", "|")` used with `.format("parquet")` or `.saveAsTable()` — remove `.option("sep", ...)` when not reading/writing CSV
-  - **Bug 20:** `.csv('')` or `.csv('file:///tmp/...')` used as final output — replace with `.write.mode("overwrite").saveAsTable("catalog.schema.table_name")`
+  - **Bug 20:** `.csv('')` or `.csv('file:///tmp/...')` used as final output — replace with `.write.mode("overwrite").saveAsTable(f"{catalog}.{schema}.{TABLE_NAME}")`. **IMPORTANT:** If the notebook has a widget parameter named `TABLE_NAME`, `TBL_NM`, or similar that holds the target table name, you MUST use that variable in the `saveAsTable()` call — do NOT hardcode the table name from the widget's default value. Use the variable: `saveAsTable(f"{catalog}.{schema}.{TABLE_NAME}")` not `saveAsTable(f"{catalog}.{schema}.IN_SOME_TABLE")`.
   - **Bug 21:** `lit(NULL)` — replace with `lit(None)`
   - **Bug 22:** `lit("NULL")` intended as actual null — replace with `lit(None)` (distinguish from legitimate string "NULL")
 
@@ -40,13 +40,65 @@ system_message: |
   - **Bug 24:** `df.join(other, "key")` produces duplicate key column — use `df.join(other, ["key"])` (list syntax) to avoid duplicate
   - **Bug 25:** Hard-coded file paths like `/etl/landing/file.dat` — replace with Unity Catalog volume paths: `/Volumes/{catalog}/{schema}/{volume_name}/file.dat`
 
+  ### 6. Source and Connection Issues
+  - **Bug 26:** Empty or incomplete DataFrame assignment like `DSLink3 = ` (nothing after `=`) — BladeBridge failed to convert a Sequential_File or flat file source. Check the downstream usage to determine the correct replacement:
+    - **If downstream uses a column like `TotalRec` or `RecCount`** (record count pattern): The source was a shell filter counting lines. Replace with:
+      ```python
+      _raw = dbutils.fs.head(f"/Volumes/{catalog}/{schema}/data/{SRC_FILE}", 1048576)
+      _lines = _raw.strip().split("\n")
+      TotalRec = len(_lines) - 2  # Subtract header + trailer lines
+      DSLink3 = spark.createDataFrame([(str(TotalRec),)], ["TotalRec"])
+      ```
+    - **If downstream uses structured columns** (normal data read): Replace with a spark.read call using the appropriate delimiter. Check if the file has headers — mainframe files often don't:
+      ```python
+      DSLink3 = spark.read.option("header", "false").option("sep", "|").csv(f"/Volumes/{catalog}/{schema}/data/{SRC_FILE}")
+      ```
+  - **Bug 27:** `(lit(VAR) .ATTRIBUTE)` — DataStage connection property access pattern like `(lit(DB_ODBC_CON) .DB_SCHEMA)` where `.DB_SCHEMA` is treated as a Python attribute. Replace with the corresponding widget parameter: `lit(DB_ODBC_CON_DB_SCHEMA)` or `lit(SCMA_NM)`. The connection object `.ATTRIBUTE` pattern should be replaced with a standalone widget variable.
+  - **Bug 28:** `TEMP_TABLE_*CON.DB_SCHEMA#.*` in `.saveAsTable()` — BladeBridge leaves unresolved connection+schema placeholders in target table references. Replace with Unity Catalog path: `.saveAsTable(f"{catalog}.{schema}.table_name")` using the actual table name from the original target node.
+  - **Bug 29:** **MANDATORY for any `.saveAsTable()` targeting `JOB_RCNCL`**: The `JOB_RCNCL` table is a shared audit table. You MUST cast EVERY column in the DataFrame to STRING before writing. Apply `.cast('string')` to every column in the `.select()` that feeds the `saveAsTable('...JOB_RCNCL')` call. Example:
+    ```python
+    RCNL = DSLink9.select(
+        col('JOB_NM').cast('string'),
+        col('PRJ_NM').cast('string'),
+        col('SCMA_NM').cast('string'),
+        col('TBL_NM').cast('string'),
+        col('SEQ_OR_SCP_NM').cast('string'),
+        col('AMT_COL_SRC').cast('string'),
+        col('TTL_AMT_SRC').cast('string'),
+        col('TTL_REC_SRC').cast('string'),
+        col('AMT_COL_TGT').cast('string'),
+        col('TTL_AMT_TGT').cast('string'),
+        col('TTL_REC_TGT').cast('string'),
+        col('POS_DT').cast('string'),
+        col('STRT_TMS').cast('string'),
+        col('END_TMS').cast('string')
+    )
+    RCNL.write.mode('append').saveAsTable(f'{catalog}.{schema}.JOB_RCNCL')
+    ```
+    This is critical — without it, different pipelines create JOB_RCNCL with conflicting column types and all subsequent writes fail.
+
+  - **Bug 30:** Pre-SQL `INSERT INTO JOB_RCNCL VALUES (...)` — BladeBridge generates INSERT statements for audit records with `TEMP_TABLE_*#` placeholders. Replace ALL placeholders with f-string widget variables and ensure the SQL is syntactically complete. The correct pattern:
+    ```python
+    spark.sql(f"""
+    INSERT INTO {catalog}.{target_schema}.JOB_RCNCL
+    (JOB_NM, PRJ_NM, SCMA_NM, TBL_NM, SEQ_OR_SCP_NM, AMT_COL_SRC, TTL_AMT_SRC, TTL_REC_SRC, AMT_COL_TGT, TTL_AMT_TGT, TTL_REC_TGT, POS_DT, STRT_TMS, END_TMS)
+    VALUES (
+        '{JOB_NM}', '{PRJ_NM}', '{SCMA_NM}', '{TBL_NM}', '{SEQ_NM}',
+        '', '0', '0', '', '0', '0',
+        '{posn_dt}', '{STRT_TMS}', '9999-12-31 23:59:59'
+    )
+    """)
+    ```
+    IMPORTANT: Keep the VALUES clause simple — use f-string variables directly like `'{JOB_NM}'`. Do NOT use CAST() around f-string variables. Ensure the VALUES clause has exactly 14 values matching the 14 column names. Do NOT leave the INSERT incomplete or malformed.
+
   ## Fix Procedure
 
-  1. Scan the entire file for all 25 bug patterns
+  1. Scan the entire file for all 30 bug patterns
   2. Fix each occurrence
-  3. Ensure the result is a valid Databricks notebook with proper cell separators
-  4. Add a comment `# FIXED (Bug N): description` above each fix so reviewers can verify
-  5. Preserve all business logic — only fix infrastructure/API issues
+  3. **CRITICAL: Update the import statement** — whenever you introduce a new PySpark function (e.g., `coalesce`, `regexp_replace`, `date_format`, `concat`, `substring`, `trim`, `ltrim`, `rtrim`, `sha2`, `left`, `right`), you MUST add it to the `from pyspark.sql.functions import ...` line. Missing imports cause NameError at runtime. Always verify every function you use appears in the imports.
+  4. Ensure the result is a valid Databricks notebook with proper cell separators
+  5. Add a comment `# FIXED (Bug N): description` above each fix so reviewers can verify
+  6. Preserve all business logic — only fix infrastructure/API issues
 
   ## Output Format
 
@@ -111,3 +163,104 @@ few_shots:
 
       # FIXED (Bug 20): .csv('') -> .saveAsTable()
       df.write.mode("overwrite").saveAsTable("bank_prod.etl.customers")
+
+  - role: user
+    content: |
+      Fix this BladeBridge output. Catalog: vn, Schema: ds2dbx.
+
+      import os
+      import oracledb
+      from pyspark.sql import *
+      from pyspark.sql.functions import *
+      from pyspark import SparkContext
+
+      dbutils.widgets.text(name = 'SRC_FILE', defaultValue = 'data.dat')
+      SRC_FILE = dbutils.widgets.get("SRC_FILE")
+      dbutils.widgets.text(name = 'SRC_PATH', defaultValue = '/source')
+      SRC_PATH = dbutils.widgets.get("SRC_PATH")
+      dbutils.widgets.text(name = 'DB_ODBC_CON', defaultValue = '')
+      DB_ODBC_CON = dbutils.widgets.get("DB_ODBC_CON")
+      dbutils.widgets.text(name = 'JOB_NM', defaultValue = 'JOB1')
+      JOB_NM = dbutils.widgets.get("JOB_NM")
+      dbutils.widgets.text(name = 'TBL_NM', defaultValue = 'MY_TABLE')
+      TBL_NM = dbutils.widgets.get("TBL_NM")
+
+      # Processing node DSLink3, type SOURCE
+      # COLUMN COUNT: 1
+      # Original node name Sequential_File_0, link DSLink3
+      DSLink3 =
+
+      # Processing node DSLink9, type TRANSFORMATION
+      DSLink9 = DSLink3.select(
+        (lit(JOB_NM)).alias('JOB_NM'),
+        (lit(DB_ODBC_CON) .DB_SCHEMA).alias('SCMA_NM'),
+        (lit(TBL_NM)).alias('TBL_NM'),
+        (col('TotalRec').cast('decimal(10, 2)')).alias('TTL_REC_SRC'),
+        (CurrentTimestamp()).alias('STRT_TMS')
+      )
+
+      RCNL = DSLink9.select(DSLink9.JOB_NM, DSLink9.SCMA_NM, DSLink9.TBL_NM, DSLink9.STRT_TMS)
+      RCNL.write.saveAsTable('TEMP_TABLE_RCNCL_CON.DB_SCHEMA#.JOB_RCNCL', mode = 'append');
+
+  - role: assistant
+    content: |
+      # Databricks notebook source
+
+      # MAGIC %md
+      # MAGIC # Fixed Migration: Sequential File to Reconciliation
+      # MAGIC BladeBridge output with automated fixes applied.
+
+      # COMMAND ----------
+
+      # FIXED (Bug 1): Removed oracledb import
+      # FIXED (Bug 2): Removed SparkContext import
+      # FIXED (Bug 3): Removed wildcard SparkSession import
+      import os
+      from pyspark.sql.functions import lit, col, current_timestamp
+
+      # COMMAND ----------
+
+      dbutils.widgets.text(name='SRC_FILE', defaultValue='data.dat')
+      SRC_FILE = dbutils.widgets.get("SRC_FILE")
+      dbutils.widgets.text(name='SRC_PATH', defaultValue='/source')
+      SRC_PATH = dbutils.widgets.get("SRC_PATH")
+      dbutils.widgets.text(name='JOB_NM', defaultValue='JOB1')
+      JOB_NM = dbutils.widgets.get("JOB_NM")
+      dbutils.widgets.text(name='TBL_NM', defaultValue='MY_TABLE')
+      TBL_NM = dbutils.widgets.get("TBL_NM")
+      dbutils.widgets.text(name='SCMA_NM', defaultValue='ds2dbx')
+      SCMA_NM = dbutils.widgets.get("SCMA_NM")
+
+      # COMMAND ----------
+
+      # FIXED (Bug 26): Empty DSLink3 — Sequential_File_0 with TotalRec column = record count pattern
+      # Count data records in the source file (exclude header + trailer lines)
+      _raw = dbutils.fs.head(f"/Volumes/vn/ds2dbx_source/data/{SRC_FILE}", 1048576)
+      _lines = _raw.strip().split("\n")
+      TotalRec = len(_lines) - 2  # Subtract header + trailer lines
+      DSLink3 = spark.createDataFrame([(str(TotalRec),)], ["TotalRec"])
+
+      # COMMAND ----------
+
+      # FIXED (Bug 27): Replaced (lit(DB_ODBC_CON) .DB_SCHEMA) with lit(SCMA_NM)
+      # FIXED (Bug 8): CurrentTimestamp() -> current_timestamp()
+      DSLink9 = DSLink3.select(
+        lit(JOB_NM).alias('JOB_NM'),
+        lit(SCMA_NM).alias('SCMA_NM'),
+        lit(TBL_NM).alias('TBL_NM'),
+        col('TotalRec').cast('decimal(10, 2)').alias('TTL_REC_SRC'),
+        current_timestamp().alias('STRT_TMS')
+      )
+
+      # COMMAND ----------
+
+      # FIXED (Bug 28): Replaced TEMP_TABLE_RCNCL_CON.DB_SCHEMA#.JOB_RCNCL with Unity Catalog table
+      # FIXED (Bug 29): Cast ALL JOB_RCNCL columns to STRING (shared audit table)
+      RCNL = DSLink9.select(
+        col('JOB_NM').cast('string'),
+        col('SCMA_NM').cast('string'),
+        col('TBL_NM').cast('string'),
+        col('TTL_REC_SRC').cast('string'),
+        col('STRT_TMS').cast('string')
+      )
+      RCNL.write.mode('append').saveAsTable('vn.ds2dbx.JOB_RCNCL')

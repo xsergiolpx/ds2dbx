@@ -130,3 +130,19 @@ bugs:
     pattern: "\\bIF\\b.*\\bTHEN\\b.*\\bELSE\\b"
     severity: "high"
     description: "IF/THEN/ELSE block in expression - use when().otherwise() in PySpark"
+
+  - name: "empty_dataframe_assignment"
+    pattern: "DSLink\\d+\\s*=\\s*$"
+    severity: "critical"
+    description: "Empty DataFrame assignment - BladeBridge failed to convert source (Sequential_File etc.)"
+    multiline: false
+
+  - name: "connection_attribute_access"
+    pattern: "lit\\(\\w+\\)\\s*\\.\\w+"
+    severity: "critical"
+    description: "DataStage connection attribute access (lit(CON).ATTR) - needs widget parameter"
+
+  - name: "temp_table_saveAsTable"
+    pattern: "saveAsTable.*TEMP_TABLE_"
+    severity: "critical"
+    description: "saveAsTable with TEMP_TABLE placeholder - needs Unity Catalog path"

@@ -34,10 +34,11 @@ system_message: |
     dbutils.widgets.text("param1", "", "Parameter 1")
     param1 = dbutils.widgets.get("param1")
     ```
+  - **IMPORTANT: Preserve the EXACT CASE of variable names from the original script.** If the script uses `TBL_CRN`, the widget must be `dbutils.widgets.text("TBL_CRN", ...)` not `dbutils.widgets.text("tbl_crn", ...)`. Databricks widget names are case-sensitive and must match the workflow parameters exactly.
   - Convert shell variables like `DATE_VAR=$(date +%Y-%m-%d)` to Python:
     ```python
     from datetime import datetime
-    date_var = datetime.now().strftime("%Y-%m-%d")
+    DATE_VAR = datetime.now().strftime("%Y-%m-%d")
     ```
   - Use f-strings to inject parameters into SQL
 

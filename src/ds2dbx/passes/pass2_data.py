@@ -100,15 +100,25 @@ class Pass2Data(BasePass):
 
             uploaded += 1
 
-            # Detect delimiter
+            # Detect delimiter and check for header
             delimiter = detect_delimiter(data_file)
-            table_name = data_file.stem.lower().replace("-", "_").replace(" ", "_")
+            first_line = data_file.read_text(encoding="utf-8", errors="ignore").split("\n")[0]
+            has_header = not any(c.isdigit() for c in first_line.split(delimiter)[0][:10]) if first_line else False
+            # Strip known database prefixes from filenames (e.g., datalake.table.csv -> table)
+            raw_stem = data_file.stem.lower()
+            for prefix in ("datalake.", "datatank.", "common_layer.", "datatank_view."):
+                if raw_stem.startswith(prefix):
+                    raw_stem = raw_stem[len(prefix):]
+                    break
+            table_name = raw_stem.replace("-", "_").replace(" ", "_").replace(".", "_")
 
             table_info.append({
                 "table_name": table_name,
                 "file_path": remote_path,
                 "delimiter": delimiter,
                 "delimiter_display": repr(delimiter),
+                "has_header": has_header,
+                "filename": data_file.name,
             })
 
         console.print(f"  Uploaded {uploaded}/{len(data_files)} files")
@@ -121,9 +131,10 @@ class Pass2Data(BasePass):
             template = Template(template_str)
             notebook_content = template.render(
                 catalog=self.config.catalog,
-                schema=self.config.schema,
+                schema=self.config.get_source_schema(),
                 tables=table_info,
                 usecase_name=manifest.name,
+                volume_path=f"{volume_path}/{safe_name}",
             )
 
             notebook_path = output_dir / f"{manifest.name}_data_loader.py"

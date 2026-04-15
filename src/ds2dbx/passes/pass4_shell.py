@@ -84,7 +84,7 @@ class Pass4Shell(BasePass):
             # Build combined input: catalog/schema hint + DDL context + script
             parts: list[str] = []
             parts.append(f"# TARGET CATALOG: {self.config.catalog}")
-            parts.append(f"# TARGET SCHEMA: {self.config.schema}")
+            parts.append(f"# TARGET SCHEMA: {self.config.get_target_schema()}")
             parts.append("")
             if ddl_context:
                 parts.append(f"# DDL CONTEXT (for reference, do not re-create these tables):\n{ddl_context}\n")

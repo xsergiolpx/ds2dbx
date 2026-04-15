@@ -71,7 +71,7 @@ class Pass1DDL(BasePass):
         parts: list[str] = []
         # Add catalog/schema as comments that the LLM prompt references
         parts.append(f"# TARGET CATALOG: {self.config.catalog}")
-        parts.append(f"# TARGET SCHEMA: {self.config.schema}")
+        parts.append(f"# TARGET SCHEMA: {self.config.get_target_schema()}")
         parts.append("")
         for ddl in ddl_files:
             parts.append(f"-- ========== {ddl.name} ==========")
