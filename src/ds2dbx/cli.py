@@ -757,5 +757,162 @@ def status(
             console.print(f"    Workflows: {wf}")
 
 
+@app.command()
+def reconcile(
+    path: str = typer.Argument(..., help="Path to use case directory or parent"),
+    config: str = ConfigOption,
+    profile: str = ProfileOption,
+):
+    """Reconcile source vs target row counts after workflow execution.
+
+    Queries JOB_RCNCL audit table and compares source/target counts per table.
+    Also queries actual table row counts for independent verification.
+    """
+    import requests
+
+    cfg = _load_cfg(config, profile, None, None)
+    host = cfg.get_host()
+    token = cfg.get_token()
+    catalog = cfg.catalog
+    source_schema = cfg.get_source_schema()
+    target_schema = cfg.get_target_schema()
+
+    if not host or not token:
+        console.print("[red]Cannot get host/token — check auth[/red]")
+        raise typer.Exit(1)
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    def run_sql(sql: str) -> list[list[str]]:
+        resp = requests.post(
+            f"{host}/api/2.0/sql/statements",
+            json={"warehouse_id": _get_warehouse(cfg), "statement": " ".join(sql.split()), "wait_timeout": "50s"},
+            headers=headers,
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        # Poll if pending
+        while data.get("status", {}).get("state") in ("PENDING", "RUNNING"):
+            import time; time.sleep(2)
+            stmt_id = data["statement_id"]
+            data = requests.get(
+                f"{host}/api/2.0/sql/statements/{stmt_id}", headers=headers
+            ).json()
+        return data.get("result", {}).get("data_array", [])
+
+    # --- 1. JOB_RCNCL reconciliation records ---
+    console.print("\n[bold]Reconciliation Report[/bold]")
+    console.print(f"  Catalog: {catalog}")
+    console.print(f"  Source schema: {source_schema}")
+    console.print(f"  Target schema: {target_schema}\n")
+
+    rcncl_rows = run_sql(f"""
+        SELECT JOB_NM, TBL_NM, TTL_REC_SRC, TTL_REC_TGT, TTL_AMT_SRC, TTL_AMT_TGT, POS_DT
+        FROM {catalog}.{target_schema}.JOB_RCNCL
+        ORDER BY JOB_NM, TBL_NM
+    """)
+
+    if rcncl_rows:
+        tbl = Table(title="JOB_RCNCL — Pipeline Reconciliation Records")
+        tbl.add_column("Job", style="cyan")
+        tbl.add_column("Table", style="bold")
+        tbl.add_column("Src Rows", justify="right")
+        tbl.add_column("Tgt Rows", justify="right")
+        tbl.add_column("Match", justify="center")
+        tbl.add_column("Src Amt", justify="right")
+        tbl.add_column("Tgt Amt", justify="right")
+        tbl.add_column("POS_DT")
+
+        for row in rcncl_rows:
+            job, table_nm, src_rows, tgt_rows, src_amt, tgt_amt, pos_dt = row[:7]
+            match = "[green]✓[/green]" if src_rows == tgt_rows else "[red]✗[/red]"
+            tbl.add_row(job, table_nm, src_rows, tgt_rows, match, src_amt, tgt_amt, pos_dt or "")
+
+        console.print(tbl)
+    else:
+        console.print("  [yellow]No JOB_RCNCL records found — workflows may not have run yet[/yellow]")
+
+    # --- 2. Actual table row counts ---
+    console.print()
+
+    # Get all tables in both schemas
+    source_tables = run_sql(f"SHOW TABLES IN {catalog}.{source_schema}")
+    target_tables = run_sql(f"SHOW TABLES IN {catalog}.{target_schema}")
+
+    src_names = {r[1] for r in source_tables} if source_tables else set()
+    tgt_names = {r[1] for r in target_tables} if target_tables else set()
+
+    # Count rows for source tables
+    src_counts: dict[str, int] = {}
+    for name in sorted(src_names):
+        rows = run_sql(f"SELECT COUNT(*) FROM {catalog}.{source_schema}.{name}")
+        if rows:
+            src_counts[name] = int(rows[0][0])
+
+    # Count rows for target tables
+    tgt_counts: dict[str, int] = {}
+    for name in sorted(tgt_names):
+        if name.lower() == "job_rcncl":
+            continue  # Skip audit table
+        rows = run_sql(f"SELECT COUNT(*) FROM {catalog}.{target_schema}.{name}")
+        if rows:
+            tgt_counts[name] = int(rows[0][0])
+
+    if src_counts:
+        tbl2 = Table(title=f"Source Tables ({catalog}.{source_schema})")
+        tbl2.add_column("Table", style="cyan")
+        tbl2.add_column("Rows", justify="right")
+        for name, cnt in sorted(src_counts.items()):
+            tbl2.add_row(name, str(cnt))
+        console.print(tbl2)
+
+    if tgt_counts:
+        tbl3 = Table(title=f"Target Tables ({catalog}.{target_schema})")
+        tbl3.add_column("Table", style="cyan")
+        tbl3.add_column("Rows", justify="right")
+        tbl3.add_column("Status", justify="center")
+        for name, cnt in sorted(tgt_counts.items()):
+            status = "[green]✓ populated[/green]" if cnt > 0 else "[yellow]empty[/yellow]"
+            tbl3.add_row(name, str(cnt), status)
+        console.print(tbl3)
+
+    # --- 3. Summary ---
+    total_src = sum(src_counts.values())
+    total_tgt = sum(tgt_counts.values())
+    populated = sum(1 for c in tgt_counts.values() if c > 0)
+    empty = sum(1 for c in tgt_counts.values() if c == 0)
+    console.print(f"\n[bold]Summary:[/bold] {len(src_counts)} source tables ({total_src:,} rows), "
+                  f"{len(tgt_counts)} target tables ({total_tgt:,} rows) — "
+                  f"{populated} populated, {empty} empty")
+
+
+def _get_warehouse(cfg: Config) -> str:
+    """Get warehouse ID for SQL Statement API."""
+    host = cfg.get_host()
+    token = cfg.get_token()
+    if not host or not token:
+        return ""
+    try:
+        import requests
+        resp = requests.get(
+            f"{host}/api/2.0/sql/warehouses",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            for wh in resp.json().get("warehouses", []):
+                if wh.get("state") in ("RUNNING", "STARTING"):
+                    return wh["id"]
+            # Fallback: return first warehouse
+            warehouses = resp.json().get("warehouses", [])
+            if warehouses:
+                return warehouses[0]["id"]
+    except Exception:
+        pass
+    return ""
+
+
 if __name__ == "__main__":
     app()

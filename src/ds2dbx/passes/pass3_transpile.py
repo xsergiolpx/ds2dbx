@@ -266,22 +266,6 @@ def _post_process_notebook(
     # Convert these to actual Python/Spark expressions.
     content = _fix_uservar_todo_expressions(content)
 
-    # --- Fix 8b: Drop table before overwrite to prevent schema merge conflicts ---
-    # When DDL creates a table with lowercase columns but the notebook writes uppercase,
-    # Delta can't merge the schemas. Add DROP TABLE before mode('overwrite').saveAsTable.
-    if "mode('overwrite')" in content or 'mode("overwrite")' in content:
-        def _add_drop_before_write(m: re.Match) -> str:
-            var = m.group(1)
-            target_expr = m.group(3)
-            # Build the DROP TABLE expression using the same target ref
-            drop_line = f'_tbl = {target_expr}\nspark.sql(f"DROP TABLE IF EXISTS {{_tbl}}")'
-            return f'{drop_line}\n{var}.write.mode("overwrite").saveAsTable({target_expr})'
-        content = re.sub(
-            r"""(\w+)\.write\.mode\(['"](overwrite)['"]\)\.saveAsTable\(([^)]+)\)""",
-            _add_drop_before_write,
-            content,
-        )
-
     # --- Fix 9: Mainframe file delimiter + schema + header filtering ---
     # When a notebook reads a CSV from Volumes and has a .toDF() with many columns,
     # it's a mainframe file ingestion pattern. Fix the delimiter, add explicit schema,
