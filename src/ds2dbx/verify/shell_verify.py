@@ -199,11 +199,16 @@ def verify_shell(source_file: Path, output_file: Path) -> list[ShellIssue]:
             f"{', '.join(sorted(missing_tables))}",
         ))
 
-    # --- Check 4: Spark SQL wrapper present ---
-    if "spark.sql" not in out_content:
+    # --- Check 4: Databricks API usage present ---
+    # Converted notebooks should use spark.sql() for SQL logic, or dbutils for
+    # file validation scripts (e.g., validate_UNIX_PIPE_COUNT_HEAD_FOOT.ksh).
+    has_spark_sql = "spark.sql" in out_content
+    has_dbutils = "dbutils." in out_content
+    has_spark_read = "spark.read" in out_content
+    if not (has_spark_sql or has_dbutils or has_spark_read):
         issues.append(ShellIssue(
             "error",
-            "Output notebook contains no spark.sql() calls",
+            "Output notebook contains no spark.sql(), dbutils, or spark.read calls",
         ))
 
     # --- Check 5: Widget parameters for shell variables ---
