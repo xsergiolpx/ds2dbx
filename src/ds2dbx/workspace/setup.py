@@ -361,6 +361,19 @@ def _detect_missing_source_tables(
             for m in re.finditer(r'saveAsTable\(\s*"\w+\.\w+\.(\w+)"', content):
                 created_tables.add(m.group(1).lower())
 
+    # 1b. Build column alias mappings from BladeBridge RAW output (deterministic).
+    # BladeBridge always produces consistent column names from DataStage XML metadata.
+    # These are the "ground truth" aliases that don't vary across LLM runs.
+    # Pattern: DSLink3.ACTION_CD.alias('ACTN_CD') → {ACTION_CD: ACTN_CD}
+    bb_alias_maps: dict[str, dict[str, str]] = {}  # notebook_stem → {oracle_col: target_col}
+    bb_output_dir = output_dir / "pass3_transpile" / "bladebridge_output"
+    if bb_output_dir.exists():
+        for nb in bb_output_dir.glob("*.py"):
+            content = nb.read_text(encoding="utf-8", errors="replace")
+            alias_map = _extract_column_aliases(content)
+            if alias_map:
+                bb_alias_maps[nb.stem] = alias_map
+
     # 2. Find tables referenced in workflow widget defaults AND workflow JSON base_parameters
     referenced_tables: dict[str, dict] = {}
 
@@ -474,9 +487,23 @@ def _detect_missing_source_tables(
         source_cols = info["columns"]
         notebook_content = info.get("notebook_content", "")
 
-        # Extract column alias mapping from notebook transformation
-        # alias_map: {SOURCE_COL: TARGET_COL} e.g. {'FORMAPPR_CD': 'FORM_DTL_ID'}
-        alias_map = _extract_column_aliases(notebook_content)
+        # Extract column alias mapping from notebook transformation.
+        # Merge BladeBridge (deterministic) + Switch (LLM) aliases.
+        # BladeBridge aliases are the ground truth — they come from DataStage XML
+        # metadata and don't vary across LLM runs.
+        alias_map = {}
+        # First: BladeBridge aliases (deterministic, preferred)
+        for bb_stem, bb_map in bb_alias_maps.items():
+            if missing_table.lower() in bb_stem.lower() or bb_stem.lower() in missing_table.lower():
+                alias_map.update(bb_map)
+                break
+        # Then: Switch aliases (may override, but BladeBridge provides the base)
+        switch_aliases = _extract_column_aliases(notebook_content)
+        if switch_aliases:
+            # Only add Switch aliases not already in BB map
+            for k, v in switch_aliases.items():
+                if k not in alias_map:
+                    alias_map[k] = v
 
         # Use alias map to find matching table: check if alias TARGET columns match DDL columns
         best_match = None
@@ -530,7 +557,16 @@ def _detect_missing_source_tables(
 
                 # Add CAST(NULL AS STRING) for columns needed by UNION ALL but missing from source.
                 # Must cast to STRING — bare NULL creates void type which Spark can't query.
+                # Scan BOTH BladeBridge raw (deterministic) and Switch (LLM) for all source columns.
                 all_needed = _extract_all_source_columns(notebook_content)
+                # Also scan the BladeBridge raw output for the same notebook
+                for bb_stem in bb_alias_maps:
+                    if missing_table.lower() in bb_stem.lower() or bb_stem.lower() in missing_table.lower():
+                        bb_nb = bb_output_dir / f"{bb_stem}.py"
+                        if bb_nb.exists():
+                            bb_cols = _extract_all_source_columns(bb_nb.read_text(encoding="utf-8", errors="replace"))
+                            all_needed = all_needed | bb_cols
+                        break
                 for needed_col in all_needed:
                     if needed_col not in covered:
                         select_parts.append(f"CAST(NULL AS STRING) AS {needed_col}")
