@@ -286,22 +286,28 @@ def _post_process_notebook(
     # and filter header/trailer rows.
     content = _fix_mainframe_file_read(content, source_files or [])
 
-    # --- Fix 10a: LoadEBAN notebooks read from source_schema, not target_schema ---
+    # --- Fix 10a: Source-reader notebooks read from source_schema, not target_schema ---
     # The LLM uses various patterns to reference the schema:
     # 1. FROM {catalog}.{target_schema}.{SRC_TBL}
     # 2. FROM {catalog}.{schema}.{SRC_TBL} where schema = "ds2dbx_target"
     # 3. FROM {catalog}.{DB_ODBC_CON_DB_SCHEMA}.{SRC_TBL}
-    # All of these should read from source_schema for LoadEBAN notebooks.
-    if "LoadEBAN" in nb_path.name and source_schema and target_schema:
-        # Fix hardcoded full path
-        content = content.replace(
-            f"FROM {catalog}.{target_schema}.",
+    # All of these should read from source_schema for source-reader notebooks.
+    # Source-reader notebooks: LoadEBAN_*, DIH_TO_BIGDATA_TO_IN_*
+    nb_name = nb_path.name
+    is_source_reader_nb = ("LoadEBAN" in nb_name or "DIH_TO_BIGDATA_TO_IN" in nb_name)
+    if is_source_reader_nb and source_schema and target_schema:
+        # Fix hardcoded full path (case-insensitive for FROM/from)
+        content = re.sub(
+            re.escape(f"FROM {catalog}.{target_schema}."),
             f"FROM {catalog}.{source_schema}.",
+            content,
+            flags=re.IGNORECASE,
         )
         # Fix f-string with explicit target_schema variable
-        content = content.replace(
-            f"FROM {{catalog}}.{{target_schema}}.",
-            f"FROM {{catalog}}.{{source_schema}}.",
+        content = re.sub(
+            r'(?i)FROM\s+\{catalog\}\.\{target_schema\}\.',
+            'FROM {catalog}.{source_schema}.',
+            content,
         )
         # Fix f-string with generic {schema} variable when schema = target_schema.
         # Add source_schema variable and replace {schema} → {source_schema} in FROM clauses.
@@ -316,27 +322,27 @@ def _post_process_notebook(
                 )
             # Replace FROM {catalog}.{schema}. with FROM {catalog}.{source_schema}. in SQL
             content = re.sub(
-                r'FROM\s+\{catalog\}\.\{schema\}\.',
+                r'(?i)FROM\s+\{catalog\}\.\{schema\}\.',
                 'FROM {catalog}.{source_schema}.',
                 content,
             )
             # Also fix FROM {schema}. (no catalog) → FROM {catalog}.{source_schema}.
             content = re.sub(
-                r'FROM\s+\{schema\}\.',
+                r'(?i)FROM\s+\{schema\}\.',
                 'FROM {catalog}.{source_schema}.',
                 content,
             )
 
         # Also fix: FROM {source_schema}. (no catalog) → FROM {catalog}.{source_schema}.
         content = re.sub(
-            r'FROM\s+\{source_schema\}\.',
+            r'(?i)FROM\s+\{source_schema\}\.',
             'FROM {catalog}.{source_schema}.',
             content,
         )
         # Fix: FROM {WIDGET_VAR}. (no catalog) → FROM {catalog}.{WIDGET_VAR}.
         # Handles patterns like FROM {DB_JDBC_CON_DB_SCHEMA}.{SRC_TBL}
         content = re.sub(
-            r'FROM\s+\{(\w*(?:SCHEMA|schema)\w*)\}\.(?!\{catalog\})',
+            r'(?i)FROM\s+\{(\w*(?:SCHEMA|schema)\w*)\}\.(?!\{catalog\})',
             r'FROM {catalog}.{\1}.',
             content,
         )
@@ -364,6 +370,25 @@ def _post_process_notebook(
                 f"FROM {catalog}.{source_schema}.",
                 f"FROM {catalog}.{target_schema}.",
             )
+
+    # --- Fix 10c: DIH_TO_BIGDATA_TO_IN notebooks must write to IN_{TBL_NM} ---
+    # In the original DataStage flow, DIH writes to an intermediate staging table
+    # with the IN_ prefix (e.g., IN_IP_X_DOC_ITM_REL). The downstream Kudu notebook
+    # reads from IN_{TBL_NM}. The LLM sometimes drops this prefix.
+    if "DIH_TO_BIGDATA_TO_IN" in nb_name:
+        # Fix: saveAsTable(f"{catalog}.{schema}.{TBL_NM}") → saveAsTable(f"{catalog}.{schema}.IN_{TBL_NM}")
+        # Only if IN_ is not already present in the write target.
+        content = re.sub(
+            r'(saveAsTable\(f"[^"]*\.)(\{TBL_NM\})(")',
+            lambda m: m.group(0) if 'IN_{TBL_NM}' in m.group(0) else f'{m.group(1)}IN_{m.group(2)}{m.group(3)}',
+            content,
+        )
+        # Also handle single-quote f-strings
+        content = re.sub(
+            r"(saveAsTable\(f'[^']*\.)(\{TBL_NM\})(')",
+            lambda m: m.group(0) if 'IN_{TBL_NM}' in m.group(0) else f"{m.group(1)}IN_{m.group(2)}{m.group(3)}",
+            content,
+        )
 
     if content != original:
         nb_path.write_text(content, encoding="utf-8")
@@ -829,6 +854,34 @@ def _fill_widget_defaults(content: str, catalog: str, source_schema: str, target
     content = re.sub(
         r"dbutils\.widgets\.text\(name\s*=\s*'(\w+)'\s*,\s*defaultValue\s*=\s*''\)",
         _replace_empty_default,
+        content,
+    )
+    # Also match positional style: dbutils.widgets.text("X", "", "description")
+    # The LLM sometimes generates this instead of keyword-arg style.
+    def _replace_positional_default(m: re.Match) -> str:
+        name = m.group(1)
+        desc = m.group(2) or ""
+        # Reuse same logic
+        name_upper = name.upper()
+        for kw in _CATALOG_KEYWORDS:
+            if kw in name_upper:
+                desc_part = f', "{desc}"' if desc else ""
+                return f'dbutils.widgets.text("{name}", "{catalog}"{desc_part})'
+        for kw in _SCHEMA_KEYWORDS:
+            if kw in name_upper:
+                if "RCNCL" in name_upper:
+                    schema_val = target_schema
+                elif is_source_reader and ("JDBC" in name_upper or "ODBC" in name_upper):
+                    schema_val = source_schema
+                else:
+                    schema_val = target_schema
+                desc_part = f', "{desc}"' if desc else ""
+                return f'dbutils.widgets.text("{name}", "{schema_val}"{desc_part})'
+        return m.group(0)
+
+    content = re.sub(
+        r'dbutils\.widgets\.text\("(\w+)",\s*""\s*(?:,\s*"([^"]*)")?\)',
+        _replace_positional_default,
         content,
     )
 

@@ -13,6 +13,7 @@ from ds2dbx.scanner.folder import UseCaseManifest
 from ds2dbx.utils.status import is_pass_completed, start_pass, complete_pass, fail_pass
 
 from ds2dbx.passes.base import BasePass
+from ds2dbx.passes.pass3_transpile import _fill_widget_defaults
 
 console = Console()
 
@@ -109,9 +110,17 @@ class Pass4Shell(BasePass):
         downloaded = switch.download_output(ws_output, output_dir)
         console.print(f"  Downloaded {len(downloaded)} converted notebook(s)")
 
-        # --- Step 5: Post-process — check for remnants ---
+        # --- Step 5: Post-process — fill widget defaults + check remnants ---
+        catalog = self.config.catalog
+        source_schema = self.config.get_source_schema()
+        target_schema = self.config.get_target_schema()
         for f in downloaded:
             content = f.read_text(encoding="utf-8", errors="replace")
+            # Fill empty widget defaults with catalog/schema
+            fixed = _fill_widget_defaults(content, catalog, source_schema, target_schema)
+            if fixed != content:
+                f.write_text(fixed, encoding="utf-8")
+                content = fixed
             remnants = _check_remnants(content)
             if remnants:
                 console.print(
