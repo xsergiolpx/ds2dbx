@@ -110,7 +110,7 @@ class Pass4Shell(BasePass):
         downloaded = switch.download_output(ws_output, output_dir)
         console.print(f"  Downloaded {len(downloaded)} converted notebook(s)")
 
-        # --- Step 5: Post-process — fill widget defaults + check remnants ---
+        # --- Step 5: Post-process — fill widget defaults + column-aware copy + check remnants ---
         catalog = self.config.catalog
         source_schema = self.config.get_source_schema()
         target_schema = self.config.get_target_schema()
@@ -119,8 +119,11 @@ class Pass4Shell(BasePass):
             # Fill empty widget defaults with catalog/schema
             fixed = _fill_widget_defaults(content, catalog, source_schema, target_schema)
             if fixed != content:
-                f.write_text(fixed, encoding="utf-8")
                 content = fixed
+            # Fix column-aware INSERT OVERWRITE for BIGDATA_TRG_LOAD notebooks.
+            # SELECT * fails when source (K_) has more columns than target (L_).
+            content = _fix_select_star_insert(content)
+            f.write_text(content, encoding="utf-8")
             remnants = _check_remnants(content)
             if remnants:
                 console.print(
@@ -135,6 +138,37 @@ class Pass4Shell(BasePass):
         }
         console.print(f"  [green]Pass 4 complete:[/green] {metrics}")
         return metrics
+
+
+def _fix_select_star_insert(content: str) -> str:
+    """Replace INSERT OVERWRITE ... SELECT * with column-aware version.
+
+    When K_ (source) table has more columns than L_ (target) table,
+    SELECT * causes DUPLICATE_COLUMNS. Read target columns first.
+    """
+    if "TBL_CRN" not in content or "TBL_TRG" not in content:
+        return content
+    if "SELECT *" not in content:
+        return content
+
+    # Replace the INSERT OVERWRITE ... SELECT * pattern with column-aware copy.
+    # Matches: INSERT OVERWRITE {cat}.{schema}.{TBL_TRG}\nSELECT * FROM {cat}.{schema}.{TBL_CRN}
+    replacement = (
+        '# Column-aware copy: read target schema to avoid DUPLICATE_COLUMNS\n'
+        'target_cols = [c.name for c in spark.table(f"vn.{DB_SCHEMA}.{TBL_TRG}").schema]\n'
+        'col_list = ", ".join(target_cols)\n'
+        'spark.sql(f"""\n'
+        'INSERT OVERWRITE vn.{DB_SCHEMA}.{TBL_TRG}\n'
+        'SELECT {col_list} FROM vn.{DB_SCHEMA}.{TBL_CRN}\n'
+        '""")'
+    )
+    content = re.sub(
+        r'spark\.sql\(f""".*?INSERT\s+OVERWRITE.*?SELECT\s+\*\s+FROM.*?"""\)',
+        replacement,
+        content,
+        flags=re.DOTALL,
+    )
+    return content
 
 
 def _check_remnants(content: str) -> list[str]:
