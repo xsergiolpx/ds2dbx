@@ -1152,8 +1152,11 @@ def _fix_mainframe_file_read(content: str, source_files: list[Path]) -> str:
     # --- Full rewrite for completely broken notebooks ---
     # BladeBridge can't convert JAVASTAGEPX (Java encryption) nodes, producing
     # garbled syntax like litrow_number(), undefined `encrypt` variable, etc.
-    # When detected, rewrite the entire notebook from file read through to write.
-    if "JAVASTAGEPX" in content or "litrow_number" in content:
+    # Only trigger when actual garbled syntax is present (not just JAVASTAGEPX in comments,
+    # since Switch preserves those comments even when it successfully fixes the notebook).
+    has_garbled_syntax = bool(re.search(r'\blitrow_number\b', content))
+    has_undefined_encrypt = bool(re.search(r'^encrypt\.\w+', content, re.MULTILINE))
+    if has_garbled_syntax or (has_undefined_encrypt and "JAVASTAGEPX" in content):
         return _full_rewrite_mainframe_notebook(content, source_files)
 
     # --- Detect column names from .toDF() or _c* alias patterns ---
