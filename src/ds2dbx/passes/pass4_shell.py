@@ -123,6 +123,8 @@ class Pass4Shell(BasePass):
             # Fix column-aware INSERT OVERWRITE for BIGDATA_TRG_LOAD notebooks.
             # SELECT * fails when source (K_) has more columns than target (L_).
             content = _fix_select_star_insert(content)
+            # Cast JOB_RCNCL STRING columns to numeric in arithmetic expressions.
+            content = _fix_job_rcncl_casts(content)
             f.write_text(content, encoding="utf-8")
             remnants = _check_remnants(content)
             if remnants:
@@ -168,6 +170,47 @@ def _fix_select_star_insert(content: str) -> str:
         content,
         flags=re.DOTALL,
     )
+    return content
+
+
+def _fix_job_rcncl_casts(content: str) -> str:
+    """Cast JOB_RCNCL STRING columns to numeric in arithmetic expressions.
+
+    JOB_RCNCL uses all-STRING columns (to avoid type conflicts across pipelines).
+    Shell notebooks that do arithmetic like TTL_REC_SRC - TTL_REC_TGT need CAST.
+    """
+    if "JOB_RCNCL" not in content:
+        return content
+
+    # CAST integer columns: TTL_REC_SRC, TTL_REC_TGT
+    for col_name in ("TTL_REC_SRC", "TTL_REC_TGT"):
+        # Match the column in arithmetic context (e.g. TTL_REC_SRC - TTL_REC_TGT)
+        # but not if already wrapped in CAST(...)
+        content = re.sub(
+            rf'(?<!CAST\()(?<!\w){col_name}(?!\w)(?!\s+AS\b)',
+            f"CAST({col_name} AS INT)",
+            content,
+        )
+        # Clean up double-wrapping: CAST(CAST(...) AS INT)
+        content = re.sub(
+            rf'CAST\(CAST\({col_name} AS INT\) AS INT\)',
+            f"CAST({col_name} AS INT)",
+            content,
+        )
+
+    # CAST double columns: TTL_AMT_SRC, TTL_AMT_TGT
+    for col_name in ("TTL_AMT_SRC", "TTL_AMT_TGT"):
+        content = re.sub(
+            rf'(?<!CAST\()(?<!\w){col_name}(?!\w)(?!\s+AS\b)',
+            f"CAST({col_name} AS DOUBLE)",
+            content,
+        )
+        content = re.sub(
+            rf'CAST\(CAST\({col_name} AS DOUBLE\) AS DOUBLE\)',
+            f"CAST({col_name} AS DOUBLE)",
+            content,
+        )
+
     return content
 
 

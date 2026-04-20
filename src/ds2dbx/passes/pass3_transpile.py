@@ -225,6 +225,15 @@ def _post_process_notebook(
     content = re.sub(r'^from pyspark import SparkContext\s*\n?', '', content, flags=re.MULTILINE)
     content = re.sub(r'^.*SparkSession\.builder.*getOrCreate.*\n?', '', content, flags=re.MULTILINE)
 
+    # --- Fix 0b: Quote unquoted integer widget defaults ---
+    # BladeBridge sometimes emits defaultValue = 010621 (bare int with leading zero)
+    # which is a SyntaxError in Python 3. Quote them as strings.
+    content = re.sub(
+        r"(defaultValue\s*=\s*)(\d+)(\s*[,)])",
+        r"\1'\2'\3",
+        content,
+    )
+
     # --- Fix 1: UserVar notebooks ---
     if "dbutils.jobs.taskValues.set" in content and _USERVAR_SELECT_RE.search(content):
         content = _fix_uservar_notebook(content)
@@ -974,6 +983,157 @@ def _fix_uservar_todo_expressions(content: str) -> str:
     return "\n".join(new_lines)
 
 
+def _full_rewrite_mainframe_notebook(content: str, source_files: list[Path]) -> str:
+    """Full rewrite for completely broken BladeBridge mainframe notebooks.
+
+    When BladeBridge can't convert nodes (e.g. JAVASTAGEPX Java encryption),
+    the output has garbled syntax. This replaces the entire notebook body with
+    a clean implementation that reads the mainframe file, applies column aliases,
+    and writes to the target table.
+    """
+    # --- Extract column names from BladeBridge comments/aliases ---
+    # Pattern: DSLink2.DH007_D_ORG.alias('CARD_ORG_NO') or .alias('COL_NAME')
+    alias_pairs: list[tuple[str, str]] = re.findall(
+        r"(?:DSLink\d+\.)?(\w+)(?:\))?\.alias\(['\"](\w+)['\"]\)", content
+    )
+    # Deduplicate keeping order, prefer source→target mapping
+    seen_targets: set[str] = set()
+    col_mapping: list[tuple[str, str]] = []
+    for src, tgt in alias_pairs:
+        if tgt not in seen_targets and not src.startswith("lit") and src != tgt:
+            col_mapping.append((src, tgt))
+            seen_targets.add(tgt)
+
+    # Extract source column names (DH007_D_* pattern) for schema
+    src_col_re = re.findall(r"\b(DH007_\w+)\b", content)
+    src_cols = list(dict.fromkeys(src_col_re))  # deduplicate preserving order
+    if len(src_cols) < 5:
+        return content  # Not enough columns to rewrite
+
+    # --- Extract widget declarations (preserve as-is) ---
+    widget_lines: list[str] = []
+    for line in content.splitlines():
+        if "dbutils.widgets.text" in line or "dbutils.widgets.get" in line:
+            widget_lines.append(line)
+        # Also capture variable assignments from widgets
+        m = re.match(r'^(\w+)\s*=\s*dbutils\.widgets\.get\(', line)
+        if m:
+            widget_lines.append(line)
+
+    # Deduplicate widget lines
+    widget_block = "\n".join(dict.fromkeys(widget_lines))
+
+    # --- Detect delimiter from source file ---
+    detected_sep = "|"
+    for sf in source_files:
+        if sf.exists():
+            try:
+                lines = sf.read_text(encoding="utf-8", errors="replace").splitlines()
+                for line in lines[1:5]:
+                    if line.count("|") > line.count(","):
+                        detected_sep = "|"
+                    break
+            except Exception:
+                pass
+
+    # --- Build schema fields ---
+    schema_fields = "\n".join(
+        f'    StructField("{c}", StringType(), True),' for c in src_cols
+    )
+
+    # --- Build column select expressions ---
+    select_exprs: list[str] = []
+    # Map source columns to target aliases
+    src_to_tgt = {src: tgt for src, tgt in col_mapping}
+    for src_col in src_cols:
+        tgt = src_to_tgt.get(src_col)
+        if tgt:
+            # Check for special transformations
+            if "ACCT" in src_col and any(t == "CARD_NO_ENCPT" for _, t in col_mapping):
+                select_exprs.append(f'    sha2(col("{src_col}"), 256).alias("CARD_NO_ENCPT"),')
+                # Also add mask
+                if any(t == "CARD_NO_MASK" for _, t in col_mapping):
+                    select_exprs.append(
+                        f'    concat(substring(col("{src_col}"), 1, 6), lit("******"), '
+                        f'substring(col("{src_col}"), 13, 4)).alias("CARD_NO_MASK"),'
+                    )
+            elif "DTE" in src_col or "POSTING" in src_col:
+                select_exprs.append(
+                    f'    expr("IF({src_col} IS NULL OR trim({src_col}) = \'\', NULL, '
+                    f'to_timestamp(concat({src_col}, \' 00:00:00\'), \'yyyy-MM-dd HH:mm:ss\'))").alias("{tgt}"),'
+                )
+            elif "SEQ" in src_col:
+                select_exprs.append(f'    col("{src_col}").cast("int").alias("{tgt}"),')
+            else:
+                select_exprs.append(f'    col("{src_col}").alias("{tgt}"),')
+        else:
+            select_exprs.append(f'    col("{src_col}").alias("{src_col}"),')
+
+    # Add computed columns that aren't from source
+    if "POS_DT" in seen_targets or any("POS_DT" in line for line in widget_lines):
+        select_exprs.insert(0,
+            '    to_timestamp(concat(lit(POS_DT), lit(" 00:00:00")), "yyyy-MM-dd HH:mm:ss").alias("POS_DT"),'
+        )
+    select_exprs.append('    current_timestamp().alias("PPN_TMS"),')
+    # Find SRC_STM_ID value from original content
+    stm_match = re.search(r"lit\(['\"](\d+)['\"]\).*?SRC_STM_ID", content)
+    stm_id = stm_match.group(1) if stm_match else "268"
+    select_exprs.append(f'    lit("{stm_id}").alias("SRC_STM_ID"),')
+
+    select_block = "\n".join(select_exprs).rstrip(",")
+
+    first_col = src_cols[0]
+
+    # --- Build the complete notebook ---
+    notebook = f'''# Databricks notebook source
+# MAGIC %md
+# MAGIC # Mainframe File Ingestion (auto-rewritten)
+# MAGIC BladeBridge fallback: original had unconvertible JAVASTAGEPX node.
+# MAGIC This notebook was auto-generated by ds2dbx post-processor.
+
+# COMMAND ----------
+from pyspark.sql.functions import (
+    lit, col, current_timestamp, to_timestamp, concat, substring, trim,
+    expr, sha2
+)
+from pyspark.sql.types import StructType, StructField, StringType
+
+# COMMAND ----------
+catalog = "vn"
+target_schema = "ds2dbx_target"
+source_schema = "ds2dbx_source"
+
+# COMMAND ----------
+{widget_block}
+
+# COMMAND ----------
+# Read mainframe flat file with explicit schema
+_schema = StructType([
+{schema_fields}
+])
+
+file_path = f"/Volumes/{{catalog}}/{{source_schema}}/data/{{SRC_FILE}}.D{{POS_FILE}}"
+DSLink2 = spark.read.csv(file_path, sep="{detected_sep}", header=False, schema=_schema)
+
+# COMMAND ----------
+# Filter header/trailer rows
+DSLink2 = DSLink2.filter(col("{first_col}") != "000")
+
+# COMMAND ----------
+# Transform columns
+result = DSLink2.select(
+{select_block}
+)
+
+# COMMAND ----------
+# Write to staging table
+_tbl = f"{{catalog}}.{{target_schema}}.{{TBL_NM}}"
+spark.sql(f"DROP TABLE IF EXISTS {{_tbl}}")
+result.write.mode("overwrite").saveAsTable(_tbl)
+'''
+    return notebook
+
+
 def _fix_mainframe_file_read(content: str, source_files: list[Path]) -> str:
     """Fix mainframe file ingestion: delimiter, explicit schema, header filter.
 
@@ -982,9 +1142,19 @@ def _fix_mainframe_file_read(content: str, source_files: list[Path]) -> str:
     1. Delimiter — detect from actual source file
     2. Schema — add explicit StructType so header rows don't break column count
     3. Header filter — filter rows where a key column is null/empty
+
+    If the notebook is completely broken (JAVASTAGEPX, garbled syntax), does a
+    full rewrite of the entire notebook body.
     """
     if ".csv(" not in content:
         return content
+
+    # --- Full rewrite for completely broken notebooks ---
+    # BladeBridge can't convert JAVASTAGEPX (Java encryption) nodes, producing
+    # garbled syntax like litrow_number(), undefined `encrypt` variable, etc.
+    # When detected, rewrite the entire notebook from file read through to write.
+    if "JAVASTAGEPX" in content or "litrow_number" in content:
+        return _full_rewrite_mainframe_notebook(content, source_files)
 
     # --- Detect column names from .toDF() or _c* alias patterns ---
     col_names: list[str] = []

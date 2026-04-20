@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from pathlib import Path
 
 import requests
@@ -401,6 +402,50 @@ def deploy_usecase(
         console.print(f"  Uploading {label}: {len(py_files)} notebook(s)")
         count = upload_directory(local_dir, ws_notebooks_path, config, verbose)
         metrics["notebooks_uploaded"] += count
+
+    # --- Step 1b: Fix missing notebook references ---
+    # The workflow may reference notebook names (task keys from DataStage) that differ
+    # from pass4 output filenames (original shell script names). Detect mismatches
+    # and upload pass4 output files with the expected alias names.
+    pass4_dir = output_dir / "pass4_shell" / "output"
+    if pass4_dir.exists():
+        pass4_stems = {f.stem for f in pass4_dir.glob("*.py")}
+        uploaded_names = set()
+        for _, rel_path in pass_dirs:
+            d = output_dir / rel_path
+            if d.exists():
+                uploaded_names |= {f.stem for f in d.glob("*.py")}
+
+        for wf_dir in [output_dir / "pass3_transpile" / "merged",
+                       output_dir / "pass3_transpile" / "bladebridge_output"]:
+            if not wf_dir.exists():
+                continue
+            for wf_file in wf_dir.glob("*.json"):
+                try:
+                    wf_data = json.loads(wf_file.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                # Collect all notebook names referenced in workflow
+                wf_nb_names = set()
+                for task in wf_data.get("tasks", []):
+                    p = task.get("notebook_task", {}).get("notebook_path", "")
+                    if p:
+                        wf_nb_names.add(p.split("/")[-1])
+                # Find missing: referenced in workflow but not uploaded
+                missing = wf_nb_names - uploaded_names
+                # Find unmatched pass4 files: in pass4 output but not in workflow
+                unmatched = pass4_stems - (wf_nb_names & pass4_stems)
+                # If exactly one missing maps to one unmatched, alias it
+                if len(missing) == 1 and len(unmatched) == 1:
+                    src_name = unmatched.pop()
+                    dst_name = missing.pop()
+                    src_file = pass4_dir / f"{src_name}.py"
+                    if src_file.exists():
+                        dst_file = pass4_dir / f"{dst_name}.py"
+                        shutil.copy2(src_file, dst_file)
+                        upload_notebook(dst_file, f"{ws_notebooks_path}/{dst_name}", config, verbose)
+                        uploaded_names.add(dst_name)
+                        console.print(f"  [yellow]Notebook alias: {src_name} -> {dst_name}[/yellow]")
 
     # --- Step 2: Create workflows from Pass 3 JSON ---
     wf_sources = [
