@@ -1179,6 +1179,17 @@ def _fix_mainframe_file_read(content: str, source_files: list[Path]) -> str:
         if len(comment_mapping) >= 5:
             col_names = comment_mapping
 
+    # Pattern 4: Direct column references like col('DH007_D_ORG') or DSLink2.DH007_D_ORG
+    # Switch sometimes uses source column names directly without any schema/toDF definition.
+    if not col_names:
+        direct_cols = re.findall(r"col\(['\"]([A-Z][A-Z0-9_]{3,})['\"]", content)
+        # Deduplicate preserving order, filter to likely source columns (prefix pattern)
+        seen = set()
+        for c in direct_cols:
+            if c not in seen and not c.startswith("_c"):
+                col_names.append(c)
+                seen.add(c)
+
     if len(col_names) < 5:
         return content  # Not a mainframe file pattern
 
@@ -1203,6 +1214,20 @@ def _fix_mainframe_file_read(content: str, source_files: list[Path]) -> str:
     content = re.sub(
         r'\.option\(\s*"sep"\s*,\s*"[^"]*"\s*\)',
         f'.option("sep", "{detected_sep}")',
+        content,
+    )
+    # Also fix: sep=',' in positional arg style
+    content = re.sub(
+        r"(\.csv\([^)]*),\s*sep\s*=\s*'[^']*'",
+        rf"\1, sep='{detected_sep}'",
+        content,
+    )
+
+    # --- Fix volume path: {schema} → {source_schema} for file reads ---
+    # Source files live in ds2dbx_source volume, not ds2dbx_target.
+    content = re.sub(
+        r'/Volumes/\{catalog\}/\{schema\}/data/',
+        '/Volumes/{catalog}/{source_schema}/data/',
         content,
     )
 
