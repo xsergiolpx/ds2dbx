@@ -136,6 +136,20 @@ def run_setup(
                 for sql in sqls:
                     _run_sql(host, headers, sql)
 
+    # --- Step 8: Create JOB_RCNCL shared audit table ---
+    # Many pipelines INSERT into JOB_RCNCL for reconciliation. If it doesn't exist,
+    # the first pipeline to run will fail. Create with all-STRING columns to avoid
+    # type conflicts when multiple pipelines write different types (Learning #14).
+    console.print(f"  Creating shared audit table {catalog}.{target_schema}.JOB_RCNCL...")
+    _run_sql(host, headers, f"""
+        CREATE TABLE IF NOT EXISTS {catalog}.{target_schema}.JOB_RCNCL (
+            JOB_NM STRING, PRJ_NM STRING, SCMA_NM STRING, TBL_NM STRING,
+            SEQ_OR_SCP_NM STRING, AMT_COL_SRC STRING, TTL_AMT_SRC STRING,
+            TTL_REC_SRC STRING, AMT_COL_TGT STRING, TTL_AMT_TGT STRING,
+            TTL_REC_TGT STRING, POS_DT STRING, STRT_TMS STRING, END_TMS STRING
+        )
+    """)
+
     return metrics
 
 
@@ -361,18 +375,29 @@ def _detect_missing_source_tables(
             for m in re.finditer(r'saveAsTable\(\s*"\w+\.\w+\.(\w+)"', content):
                 created_tables.add(m.group(1).lower())
 
-    # 1b. Build column alias mappings from BladeBridge RAW output (deterministic).
-    # BladeBridge always produces consistent column names from DataStage XML metadata.
-    # These are the "ground truth" aliases that don't vary across LLM runs.
-    # Pattern: DSLink3.ACTION_CD.alias('ACTN_CD') → {ACTION_CD: ACTN_CD}
-    bb_alias_maps: dict[str, dict[str, str]] = {}  # notebook_stem → {oracle_col: target_col}
+    # 1b. Build column alias mappings + all source columns from BladeBridge RAW output.
+    # BladeBridge is deterministic (rule-based) — these are the "ground truth" column
+    # names that don't vary across LLM runs. We extract:
+    #   - alias_map: {ORACLE_COL: TARGET_COL} e.g. {ACTION_CD: ACTN_CD}
+    #   - all_columns: set of ALL column names referenced in UNION ALL SQL
+    # Both indexed by SRC_TBL value for direct lookup during view creation.
+    bb_src_tbl_data: dict[str, dict] = {}  # SRC_TBL → {aliases: {}, all_columns: set()}
     bb_output_dir = output_dir / "pass3_transpile" / "bladebridge_output"
     if bb_output_dir.exists():
         for nb in bb_output_dir.glob("*.py"):
             content = nb.read_text(encoding="utf-8", errors="replace")
             alias_map = _extract_column_aliases(content)
-            if alias_map:
-                bb_alias_maps[nb.stem] = alias_map
+            all_cols = set(_extract_all_source_columns(content))
+            if alias_map or all_cols:
+                # Index by SRC_TBL widget value
+                for m in re.finditer(r"defaultValue\s*=\s*'(\w+)'", content):
+                    val = m.group(1)
+                    if val.startswith(("V_", "P_", "IN_", "K_", "L_")):
+                        bb_src_tbl_data[val] = {
+                            "aliases": alias_map,
+                            "all_columns": all_cols,
+                        }
+                        break
 
     # 2. Find tables referenced in workflow widget defaults AND workflow JSON base_parameters
     referenced_tables: dict[str, dict] = {}
@@ -488,19 +513,15 @@ def _detect_missing_source_tables(
         notebook_content = info.get("notebook_content", "")
 
         # Extract column alias mapping from notebook transformation.
-        # Merge BladeBridge (deterministic) + Switch (LLM) aliases.
-        # BladeBridge aliases are the ground truth — they come from DataStage XML
-        # metadata and don't vary across LLM runs.
+        # BladeBridge aliases (deterministic) are the ground truth.
+        # Switch aliases (LLM) supplement for any patterns BB doesn't capture.
         alias_map = {}
-        # First: BladeBridge aliases (deterministic, preferred)
-        for bb_stem, bb_map in bb_alias_maps.items():
-            if missing_table.lower() in bb_stem.lower() or bb_stem.lower() in missing_table.lower():
-                alias_map.update(bb_map)
-                break
-        # Then: Switch aliases (may override, but BladeBridge provides the base)
+        bb_data = bb_src_tbl_data.get(missing_table, {})
+        if bb_data.get("aliases"):
+            alias_map.update(bb_data["aliases"])
+        # Supplement with Switch aliases
         switch_aliases = _extract_column_aliases(notebook_content)
         if switch_aliases:
-            # Only add Switch aliases not already in BB map
             for k, v in switch_aliases.items():
                 if k not in alias_map:
                     alias_map[k] = v
@@ -557,16 +578,11 @@ def _detect_missing_source_tables(
 
                 # Add CAST(NULL AS STRING) for columns needed by UNION ALL but missing from source.
                 # Must cast to STRING — bare NULL creates void type which Spark can't query.
-                # Scan BOTH BladeBridge raw (deterministic) and Switch (LLM) for all source columns.
-                all_needed = _extract_all_source_columns(notebook_content)
-                # Also scan the BladeBridge raw output for the same notebook
-                for bb_stem in bb_alias_maps:
-                    if missing_table.lower() in bb_stem.lower() or bb_stem.lower() in missing_table.lower():
-                        bb_nb = bb_output_dir / f"{bb_stem}.py"
-                        if bb_nb.exists():
-                            bb_cols = _extract_all_source_columns(bb_nb.read_text(encoding="utf-8", errors="replace"))
-                            all_needed = all_needed | bb_cols
-                        break
+                # Merge columns from Switch (LLM) + BladeBridge (deterministic).
+                all_needed = set(_extract_all_source_columns(notebook_content))
+                # Add BB all_columns (pre-built, no file scanning needed)
+                if bb_data.get("all_columns"):
+                    all_needed = all_needed | bb_data["all_columns"]
                 for needed_col in all_needed:
                     if needed_col not in covered:
                         select_parts.append(f"CAST(NULL AS STRING) AS {needed_col}")
@@ -579,7 +595,7 @@ def _detect_missing_source_tables(
                 )
             else:
                 # No alias mapping — use SELECT * but still add NULL for missing columns
-                all_needed = _extract_all_source_columns(notebook_content)
+                all_needed = set(_extract_all_source_columns(notebook_content))
                 target_cols_upper = {c.upper() for c in target_cols}
                 # Also include base names (after dot)
                 for tc in target_cols:
@@ -612,7 +628,7 @@ def _detect_missing_source_tables(
                 # in the source table (the notebook's first SELECT casts them to NULL anyway).
                 fallback_cols = table_columns.get(fallback, [])
                 notebook_content = info.get("notebook_content", "")
-                all_needed = _extract_all_source_columns(notebook_content) if notebook_content else []
+                all_needed = set(_extract_all_source_columns(notebook_content)) if notebook_content else set()
                 reverse_map = {v.lower(): k for k, v in alias_map.items()} if alias_map else {}
 
                 # Map actual source columns: rename if alias exists
@@ -669,15 +685,26 @@ def _detect_missing_source_tables(
 def _extract_all_source_columns(content: str) -> list[str]:
     """Extract ALL column names referenced in SELECT ... FROM source table patterns.
 
-    Handles two patterns:
-    1. UNION ALL second SELECT: reads actual columns from source table
-    2. Straight SELECT ... FROM {source_schema}: reads columns directly
+    Handles three patterns:
+    1. UNION ALL first SELECT: cast(NULL as TYPE) COLUMN_NAME — column names after type cast
+    2. UNION ALL second SELECT: reads actual columns from source table
+    3. Straight SELECT ... FROM {source_schema}: reads columns directly
 
     Returns column names that MUST exist in the source table.
     """
     columns = []
     skip_words = {"NULL", "AS", "CAST", "SELECT", "COUNT", "SUM", "TRIM", "OVER",
                   "0", "1", "SUBSTR", "TO_DATE", "CONCAT", "CURRENT_TIMESTAMP"}
+
+    # Pattern 0: Extract column names from cast(NULL as TYPE) COLUMN_NAME in UNION ALL first SELECT
+    # These are Oracle-style column names that the notebook references.
+    for m in re.finditer(
+        r"cast\s*\(\s*NULL\s+as\s+\w+(?:\([^)]*\))?\s*\)\s+(\w+)",
+        content, re.IGNORECASE,
+    ):
+        col = m.group(1).upper()
+        if col not in skip_words and col not in columns:
+            columns.append(col)
 
     def _parse_select_columns(select_clause: str) -> list[str]:
         cols = []
@@ -695,10 +722,13 @@ def _extract_all_source_columns(content: str) -> list[str]:
                     cols.append(col_name)
         return cols
 
-    # Pattern 1: UNION ALL second SELECT
+    # Pattern 1: UNION ALL second SELECT — merge with Pattern 0 results
     m = re.search(r'UNION\s+ALL\s*\n\s*SELECT\s+(.*?)FROM\s', content, re.DOTALL | re.IGNORECASE)
     if m:
-        columns = _parse_select_columns(m.group(1))
+        p1_cols = _parse_select_columns(m.group(1))
+        for c in p1_cols:
+            if c not in columns:
+                columns.append(c)
         if columns:
             return columns
 
@@ -718,18 +748,30 @@ def _extract_column_aliases(content: str) -> dict[str, str]:
 
     Looks for patterns like:
         col('FORMAPPR_CD').alias('FORM_DTL_ID')
+        DSLink3.ACTION_CD.alias('ACTN_CD')
     Returns: {SOURCE_COLUMN: TARGET_COLUMN} e.g. {'FORMAPPR_CD': 'FORM_DTL_ID'}
     """
     alias_map: dict[str, str] = {}
-    # Pattern: col('SOURCE_COL').alias('TARGET_COL') or col("SOURCE_COL").alias("TARGET_COL")
+    # Pattern 1: col('SOURCE_COL').alias('TARGET_COL')
     for m in re.finditer(
         r"""col\(\s*['"](\w+)['"]\s*\)\s*\.alias\(\s*['"](\w+)['"]\s*\)""",
         content,
     ):
         source_col = m.group(1)
         target_col = m.group(2)
-        if source_col.upper() != target_col.upper():  # Only real renames
+        if source_col.upper() != target_col.upper():
             alias_map[source_col.upper()] = target_col.upper()
+
+    # Pattern 2: DSLink*.SOURCE_COL.alias('TARGET_COL') — BladeBridge raw output
+    for m in re.finditer(
+        r"""DSLink\d+\.(\w+)\.alias\(\s*['"](\w+)['"]\s*\)""",
+        content,
+    ):
+        source_col = m.group(1)
+        target_col = m.group(2)
+        if source_col.upper() != target_col.upper():
+            alias_map[source_col.upper()] = target_col.upper()
+
     return alias_map
 
 

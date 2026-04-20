@@ -141,6 +141,14 @@ class Pass3Transpile(BasePass):
             shutil.copy2(f, merged_dir / f.name)
         for f in switch_output_dir.glob("*.py"):
             shutil.copy2(f, merged_dir / f.name)
+        # Fallback: include BladeBridge versions of notebooks Switch couldn't fix.
+        # These are broken but post-processing may still fix them deterministically.
+        # Without this, unfixed notebooks are silently dropped and the workflow fails.
+        merged_names = {f.stem for f in merged_dir.glob("*.py")}
+        for f in bb_output_dir.glob("*.py"):
+            if f.stem not in merged_names:
+                shutil.copy2(f, merged_dir / f.name)
+                console.print(f"  [yellow]Fallback: using BladeBridge version for {f.name}[/yellow]")
         # Copy clean workflows too
         for f in bb_output_dir.rglob("*.json"):
             shutil.copy2(f, merged_dir / f.name)
@@ -211,6 +219,12 @@ def _post_process_notebook(
     content = nb_path.read_text(encoding="utf-8", errors="replace")
     original = content
 
+    # --- Fix 0: Remove invalid imports (oracledb, SparkContext, SparkSession) ---
+    # BladeBridge fallback notebooks may have these. They cause ImportError on Databricks.
+    content = re.sub(r'^import oracledb\s*\n?', '', content, flags=re.MULTILINE)
+    content = re.sub(r'^from pyspark import SparkContext\s*\n?', '', content, flags=re.MULTILINE)
+    content = re.sub(r'^.*SparkSession\.builder.*getOrCreate.*\n?', '', content, flags=re.MULTILINE)
+
     # --- Fix 1: UserVar notebooks ---
     if "dbutils.jobs.taskValues.set" in content and _USERVAR_SELECT_RE.search(content):
         content = _fix_uservar_notebook(content)
@@ -272,7 +286,70 @@ def _post_process_notebook(
     # and filter header/trailer rows.
     content = _fix_mainframe_file_read(content, source_files or [])
 
-    # --- Fix 10: RCNCL notebooks read from target_schema, not source_schema ---
+    # --- Fix 10a: LoadEBAN notebooks read from source_schema, not target_schema ---
+    # The LLM uses various patterns to reference the schema:
+    # 1. FROM {catalog}.{target_schema}.{SRC_TBL}
+    # 2. FROM {catalog}.{schema}.{SRC_TBL} where schema = "ds2dbx_target"
+    # 3. FROM {catalog}.{DB_ODBC_CON_DB_SCHEMA}.{SRC_TBL}
+    # All of these should read from source_schema for LoadEBAN notebooks.
+    if "LoadEBAN" in nb_path.name and source_schema and target_schema:
+        # Fix hardcoded full path
+        content = content.replace(
+            f"FROM {catalog}.{target_schema}.",
+            f"FROM {catalog}.{source_schema}.",
+        )
+        # Fix f-string with explicit target_schema variable
+        content = content.replace(
+            f"FROM {{catalog}}.{{target_schema}}.",
+            f"FROM {{catalog}}.{{source_schema}}.",
+        )
+        # Fix f-string with generic {schema} variable when schema = target_schema.
+        # Add source_schema variable and replace {schema} → {source_schema} in FROM clauses.
+        if re.search(r'schema\s*=\s*["\']' + re.escape(target_schema) + r'["\']', content):
+            # Add source_schema definition if not present
+            if "source_schema" not in content:
+                content = re.sub(
+                    r'(schema\s*=\s*["\']' + re.escape(target_schema) + r'["\'])',
+                    rf'\1\nsource_schema = "{source_schema}"',
+                    content,
+                    count=1,
+                )
+            # Replace FROM {catalog}.{schema}. with FROM {catalog}.{source_schema}. in SQL
+            content = re.sub(
+                r'FROM\s+\{catalog\}\.\{schema\}\.',
+                'FROM {catalog}.{source_schema}.',
+                content,
+            )
+            # Also fix FROM {schema}. (no catalog) → FROM {catalog}.{source_schema}.
+            content = re.sub(
+                r'FROM\s+\{schema\}\.',
+                'FROM {catalog}.{source_schema}.',
+                content,
+            )
+
+        # Also fix: FROM {source_schema}. (no catalog) → FROM {catalog}.{source_schema}.
+        content = re.sub(
+            r'FROM\s+\{source_schema\}\.',
+            'FROM {catalog}.{source_schema}.',
+            content,
+        )
+        # Fix: FROM {WIDGET_VAR}. (no catalog) → FROM {catalog}.{WIDGET_VAR}.
+        # Handles patterns like FROM {DB_JDBC_CON_DB_SCHEMA}.{SRC_TBL}
+        content = re.sub(
+            r'FROM\s+\{(\w*(?:SCHEMA|schema)\w*)\}\.(?!\{catalog\})',
+            r'FROM {catalog}.{\1}.',
+            content,
+        )
+        # Add catalog variable if not present
+        if f'catalog = "{catalog}"' not in content and "catalog = " not in content:
+            content = re.sub(
+                r'(source_schema\s*=\s*"[^"]*")',
+                rf'catalog = "{catalog}"\n\1',
+                content,
+                count=1,
+            )
+
+    # --- Fix 10b: RCNCL notebooks read from target_schema, not source_schema ---
     # RCNCL reconciles target tables. The LLM sometimes puts source_schema in
     # FROM clauses, but RCNCL reads from target_schema.
     if "RCNCL_TRG" in nb_path.name and target_schema and source_schema:
@@ -712,8 +789,19 @@ def _fill_widget_defaults(content: str, catalog: str, source_schema: str, target
         dbutils.widgets.text(name='DB_ODBC_CON_DB_NAME', defaultValue='')
 
     This fills empty defaults with the appropriate catalog/schema.
-    Source-related widgets get source_schema, others get target_schema.
+    Context-aware: LoadEBAN notebooks read from source_schema, RCNCL/BIGDATA
+    notebooks read from target_schema. Detect by checking if the notebook reads
+    from source_schema (has FROM {source_schema} or SRC_TBL widget).
     """
+    # Determine if this notebook reads from source (LoadEBAN pattern)
+    # vs writes to target (RCNCL/BIGDATA pattern).
+    # LoadEBAN notebooks have SRC_TBL widget and read via UNION ALL from source.
+    # RCNCL/BIGDATA notebooks read from target tables (P_*, K_*).
+    has_src_tbl_widget = bool(re.search(r"SRC_TBL", content))
+    has_union_all = bool(re.search(r"UNION\s+ALL", content, re.IGNORECASE))
+    has_source_schema_ref = bool(re.search(r"source_schema", content))
+    is_source_reader = (has_src_tbl_widget and has_union_all) or has_source_schema_ref
+
     def _replace_empty_default(m: re.Match) -> str:
         name = m.group(1)
         name_upper = name.upper()
@@ -724,7 +812,16 @@ def _fill_widget_defaults(content: str, catalog: str, source_schema: str, target
                 return f"dbutils.widgets.text(name = '{name}', defaultValue = '{catalog}')"
         for kw in _SCHEMA_KEYWORDS:
             if kw in name_upper:
-                return f"dbutils.widgets.text(name = '{name}', defaultValue = '{target_schema}')"
+                # RCNCL_CON_DB_SCHEMA always uses target_schema (JOB_RCNCL lives there).
+                # DB_JDBC/ODBC_CON_DB_SCHEMA in LoadEBAN uses source_schema (reads source).
+                # Everything else uses target_schema.
+                if "RCNCL" in name_upper:
+                    schema_val = target_schema
+                elif is_source_reader and ("JDBC" in name_upper or "ODBC" in name_upper):
+                    schema_val = source_schema
+                else:
+                    schema_val = target_schema
+                return f"dbutils.widgets.text(name = '{name}', defaultValue = '{schema_val}')"
 
         return m.group(0)  # No match — leave as-is
 

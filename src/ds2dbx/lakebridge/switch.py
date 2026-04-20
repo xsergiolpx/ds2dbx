@@ -96,6 +96,15 @@ class SwitchRunner:
         if custom_prompt:
             self._setup_custom_prompt(custom_prompt)
 
+        # Ensure the output workspace folder exists before Switch writes to it.
+        # Without this, Switch silently produces no output if the parent doesn't exist.
+        run_command(
+            ["databricks", "workspace", "mkdirs", output_ws_folder,
+             "--profile", self.profile],
+            verbose=self.verbose,
+            description="Create output folder",
+        )
+
         cmd = [
             "databricks", "labs", "lakebridge", "llm-transpile",
             "--input-source", str(input_dir),

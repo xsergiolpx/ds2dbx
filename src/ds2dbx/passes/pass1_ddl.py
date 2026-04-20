@@ -94,6 +94,18 @@ class Pass1DDL(BasePass):
         downloaded = switch.download_output(ws_output, output_dir)
         console.print(f"  Downloaded {len(downloaded)} file(s) from workspace")
 
+        # --- Step 3b: Fallback if Switch produced empty output ---
+        # When the LLM returns nothing, generate DDL deterministically using regex.
+        if not downloaded:
+            console.print("  [yellow]Switch DDL output empty — using deterministic fallback[/yellow]")
+            fallback_path = output_dir / "all_ddl.py"
+            content = concat_path.read_text(encoding="utf-8", errors="replace")
+            catalog = self.config.catalog
+            target_schema = self.config.get_target_schema()
+            converted = _deterministic_ddl_convert(content, catalog, target_schema)
+            fallback_path.write_text(converted, encoding="utf-8")
+            downloaded = [fallback_path]
+
         # --- Step 4: Post-process outputs ---
         checks_passed = 0
         checks_failed = 0
@@ -185,6 +197,115 @@ def _repair_commented_create_table(content: str) -> str:
         return f'spark.sql({tq}\n{create_stmt}{columns}{closing}{partition}\n{tq})'
 
     return _COMMENTED_CREATE_RE.sub(_replacer, content)
+
+
+def _deterministic_ddl_convert(content: str, catalog: str, target_schema: str) -> str:
+    """Convert DDL deterministically using regex when Switch LLM fails.
+
+    This is a fallback that handles the most common Hive/Kudu DDL patterns
+    without relying on the LLM. It produces valid Databricks SQL.
+    """
+    lines = content.splitlines()
+    output_lines = [
+        "# Databricks notebook source",
+        "# MAGIC %md",
+        "# MAGIC # DDL — Deterministic Conversion (Switch fallback)",
+        "",
+        "# COMMAND ----------",
+        f'spark.sql("USE CATALOG {catalog}")',
+        f'spark.sql("USE SCHEMA {target_schema}")',
+        "",
+    ]
+
+    # Extract CREATE TABLE/VIEW statements and convert them
+    current_stmt = []
+    in_create = False
+
+    for line in lines:
+        stripped = line.strip()
+        # Detect start of CREATE statement
+        if re.match(r'CREATE\s+(EXTERNAL\s+)?TABLE|CREATE\s+(OR\s+REPLACE\s+)?VIEW', stripped, re.IGNORECASE):
+            in_create = True
+            current_stmt = [line]
+            continue
+        if in_create:
+            current_stmt.append(line)
+            # Detect end of statement
+            if stripped.endswith(';') or (stripped == ')' and not any(kw in line.upper() for kw in ['PARTITION', 'STORED', 'ROW'])):
+                stmt = "\n".join(current_stmt)
+                converted = _convert_single_ddl(stmt, catalog, target_schema)
+                if converted:
+                    output_lines.append("# COMMAND ----------")
+                    output_lines.append(converted)
+                    output_lines.append("")
+                in_create = False
+                current_stmt = []
+
+    # Handle last statement if no trailing semicolon
+    if current_stmt:
+        stmt = "\n".join(current_stmt)
+        converted = _convert_single_ddl(stmt, catalog, target_schema)
+        if converted:
+            output_lines.append("# COMMAND ----------")
+            output_lines.append(converted)
+
+    return "\n".join(output_lines)
+
+
+def _convert_single_ddl(stmt: str, catalog: str, target_schema: str) -> str:
+    """Convert a single DDL statement to Databricks spark.sql()."""
+    # Remove storage clauses
+    stmt = _HDFS_RE.sub("", stmt)
+    stmt = _STORED_AS_RE.sub("", stmt)
+    stmt = _ROW_FORMAT_RE.sub("", stmt)
+    stmt = _KUDU_TBLPROPS_RE.sub("", stmt)
+    stmt = _PARTITION_HASH_RE.sub("", stmt)
+    # Remove trailing semicolons
+    stmt = re.sub(r';\s*$', '', stmt)
+    # Remove NOT NULL / NULL column constraints
+    stmt = re.sub(r'\s+NOT\s+NULL', '', stmt, flags=re.IGNORECASE)
+    stmt = re.sub(r'\s+NULL(?=\s*[,)])', '', stmt, flags=re.IGNORECASE)
+    # Remove PRIMARY KEY
+    stmt = re.sub(r',?\s*PRIMARY\s+KEY\s*\([^)]*\)', '', stmt, flags=re.IGNORECASE)
+    # Remove ENCODING/COMPRESSION column attributes
+    stmt = re.sub(r'\s+ENCODING\s+\w+', '', stmt, flags=re.IGNORECASE)
+    stmt = re.sub(r'\s+COMPRESSION\s+\w+', '', stmt, flags=re.IGNORECASE)
+    stmt = re.sub(r'\s+DEFAULT\s+\w+', '', stmt, flags=re.IGNORECASE)
+    stmt = re.sub(r'\s+BLOCK_SIZE\s+\d+', '', stmt, flags=re.IGNORECASE)
+
+    # Fix table names: strip source schema, use catalog.target_schema.table_name
+    # Pattern: CREATE [EXTERNAL] TABLE [IF NOT EXISTS] schema.table_name
+    stmt = re.sub(
+        r'CREATE\s+EXTERNAL\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?(\w+)\.(\w+)',
+        lambda m: f'CREATE TABLE IF NOT EXISTS {catalog}.{target_schema}.{m.group(3)}',
+        stmt, flags=re.IGNORECASE,
+    )
+    stmt = re.sub(
+        r'CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?(\w+)\.(\w+)',
+        lambda m: f'CREATE TABLE IF NOT EXISTS {catalog}.{target_schema}.{m.group(3)}',
+        stmt, flags=re.IGNORECASE,
+    )
+    stmt = re.sub(
+        r'CREATE\s+(OR\s+REPLACE\s+)?VIEW\s+(\w+)\.(\w+)',
+        lambda m: f'CREATE OR REPLACE VIEW {catalog}.{target_schema}.{m.group(3)}',
+        stmt, flags=re.IGNORECASE,
+    )
+
+    # Fix FROM references in views
+    stmt = re.sub(
+        r'FROM\s+(\w+)\.(\w+)',
+        lambda m: f'FROM {catalog}.{target_schema}.{m.group(2)}',
+        stmt, flags=re.IGNORECASE,
+    )
+
+    # Clean up empty lines
+    stmt = re.sub(r'\n{3,}', '\n\n', stmt)
+    stmt = stmt.strip()
+
+    if not stmt:
+        return ""
+
+    return f'spark.sql("""\n{stmt}\n""")'
 
 
 def _count_remnants(content: str) -> int:
