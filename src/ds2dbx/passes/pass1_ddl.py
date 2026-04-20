@@ -99,7 +99,11 @@ class Pass1DDL(BasePass):
         checks_failed = 0
         for f in downloaded:
             original = f.read_text(encoding="utf-8", errors="replace")
-            cleaned = _post_process(original)
+            cleaned = _post_process(
+                original,
+                catalog=self.config.catalog,
+                target_schema=self.config.get_target_schema(),
+            )
             f.write_text(cleaned, encoding="utf-8")
             issues = _count_remnants(cleaned)
             if issues == 0:
@@ -118,7 +122,7 @@ class Pass1DDL(BasePass):
         return metrics
 
 
-def _post_process(content: str) -> str:
+def _post_process(content: str, catalog: str = "", target_schema: str = "") -> str:
     """Remove HDFS locations, STORED AS, ROW FORMAT that the LLM may have missed."""
     # Fix malformed CREATE TABLE where LLM commented out the statement
     content = _repair_commented_create_table(content)
@@ -127,6 +131,26 @@ def _post_process(content: str) -> str:
     content = _ROW_FORMAT_RE.sub("", content)
     content = _KUDU_TBLPROPS_RE.sub("", content)
     content = _PARTITION_HASH_RE.sub("", content)
+
+    # Fix 4-part names: catalog.schema.original_schema.table → catalog.schema.table
+    # The LLM sometimes preserves the original schema (e.g., common_layer, datatank_view)
+    # as part of the table name, creating invalid 4-part references.
+    if catalog and target_schema:
+        # Match: catalog.schema.EXTRA_PART.table_name — collapse to catalog.schema.table_name
+        content = re.sub(
+            rf'({re.escape(catalog)}\.{re.escape(target_schema)})\.\w+\.(\w+)',
+            rf'\1.\2',
+            content,
+        )
+
+    # Ensure all CREATE TABLE use IF NOT EXISTS
+    content = re.sub(
+        r'CREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS)',
+        'CREATE TABLE IF NOT EXISTS ',
+        content,
+        flags=re.IGNORECASE,
+    )
+
     # Clean up leftover blank lines
     content = re.sub(r"\n{3,}", "\n\n", content)
     return content

@@ -27,8 +27,14 @@ system_message: |
   - Do NOT add `USING DELTA` — it is the default in Databricks
 
   ## 4. Unity Catalog Namespace:
-  - All table references must use three-level namespace: `catalog.schema.table_name`
+  - All table references MUST use exactly three-level namespace: `catalog.schema.table_name`
   - The catalog and schema are provided as TARGET CATALOG and TARGET SCHEMA comments in the input
+  - CRITICAL: Strip the original source schema from table names. For example:
+    - Source: `CREATE TABLE datalake.my_table` → Output: `CREATE TABLE IF NOT EXISTS catalog.target_schema.my_table`
+    - Source: `CREATE VIEW datatank_view.my_view` → Output: `CREATE OR REPLACE VIEW catalog.target_schema.my_view`
+    - Source: `CREATE VIEW common_layer.v_master` → Output: `CREATE OR REPLACE VIEW catalog.target_schema.v_master`
+    - NEVER produce 4-part names like `catalog.schema.original_schema.table` — always strip the source schema prefix
+  - The table name is the LAST part of the original qualified name (after the last dot)
 
   ## 5. Preserve Partition Columns:
   - Keep `PARTITIONED BY (col type, ...)` clauses — Delta Lake supports them
