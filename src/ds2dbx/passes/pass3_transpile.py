@@ -1079,9 +1079,6 @@ def _full_rewrite_mainframe_notebook(content: str, source_files: list[Path]) -> 
     stm_match = re.search(r"lit\(['\"](\d+)['\"]\).*?SRC_STM_ID", content)
     stm_id = stm_match.group(1) if stm_match else "268"
     select_exprs.append(f'    lit("{stm_id}").alias("SRC_STM_ID"),')
-    # Add partition columns for BIGDATA_TRG_APPEND downstream
-    select_exprs.append('    substring(lit(POS_DT), 1, 4).alias("ptn_yyyy"),')
-    select_exprs.append('    substring(lit(POS_DT), 6, 2).alias("ptn_mm"),')
 
     select_block = "\n".join(select_exprs).rstrip(",")
 
@@ -1300,18 +1297,6 @@ def _fix_mainframe_file_read(content: str, source_files: list[Path]) -> str:
     if csv_close:
         insert_pos = csv_close.end()
         content = content[:insert_pos] + filter_line + content[insert_pos:]
-
-    # --- Add partition columns (ptn_yyyy, ptn_mm) if target table is partitioned ---
-    # File ingestion pipelines write to IN_ tables, then BIGDATA_TRG copies to P_ tables
-    # which are PARTITIONED BY (ptn_yyyy, ptn_mm). The IN_ table must include these columns.
-    if "ptn_yyyy" not in content and re.search(r"POS_DT", content):
-        # Find the last .select() block before .saveAsTable() and add partition columns
-        content = re.sub(
-            r"(col\(['\"]SRC_STM_ID['\"]\))\s*\n(\s*\))",
-            r"\1,\n    substring(lit(POS_DT), 1, 4).alias('ptn_yyyy'),\n"
-            r"    substring(lit(POS_DT), 6, 2).alias('ptn_mm')\n\2",
-            content,
-        )
 
     return content
 

@@ -145,20 +145,25 @@ class Pass4Shell(BasePass):
 def _fix_select_star_insert(content: str) -> str:
     """Replace INSERT OVERWRITE ... SELECT * with column-aware version.
 
-    When K_ (source) table has more columns than L_ (target) table,
-    SELECT * causes DUPLICATE_COLUMNS. Read target columns first.
+    Only applies to BIGDATA_TRG_LOAD_ONETIME notebooks (UC2 SCD pattern) where
+    K_ source has extra columns (ident_no_hash) that L_ target doesn't.
+    Does NOT apply to BIGDATA_TRG_APPEND notebooks (UC1/UC3) where SELECT * works.
     """
     if "TBL_CRN" not in content or "TBL_TRG" not in content:
         return content
     if "SELECT *" not in content:
         return content
+    # Only apply to LOAD_ONETIME pattern, not APPEND pattern
+    # APPEND notebooks have PERIOD_KEY or PTN_YYYY widgets (partition logic)
+    if "PERIOD_KEY" in content or "PTN_YYYY" in content or "PTN_MM" in content:
+        return content
 
-    # Replace the INSERT OVERWRITE ... SELECT * pattern with column-aware copy.
-    # Matches: INSERT OVERWRITE {cat}.{schema}.{TBL_TRG}\nSELECT * FROM {cat}.{schema}.{TBL_CRN}
     replacement = (
-        '# Column-aware copy: read target schema to avoid DUPLICATE_COLUMNS\n'
-        'target_cols = [c.name for c in spark.table(f"vn.{DB_SCHEMA}.{TBL_TRG}").schema]\n'
-        'col_list = ", ".join(target_cols)\n'
+        '# Column-aware copy: use intersection of source & target columns (case-insensitive)\n'
+        '# Handles K_ table having extra columns vs L_ target (DUPLICATE_COLUMNS)\n'
+        'src_cols = {c.name.lower() for c in spark.table(f"vn.{DB_SCHEMA}.{TBL_CRN}").schema}\n'
+        'tgt_cols = [c.name for c in spark.table(f"vn.{DB_SCHEMA}.{TBL_TRG}").schema]\n'
+        'col_list = ", ".join(c for c in tgt_cols if c.lower() in src_cols)\n'
         'spark.sql(f"""\n'
         'INSERT OVERWRITE vn.{DB_SCHEMA}.{TBL_TRG}\n'
         'SELECT {col_list} FROM vn.{DB_SCHEMA}.{TBL_CRN}\n'
