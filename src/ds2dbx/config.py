@@ -32,6 +32,7 @@ class LakebridgeConfig:
     target_technology: str = "PYSPARK"
     concurrency: int = 4
     max_fix_attempts: int = 5
+    cli_path: str = ""  # Optional: explicit path to databricks CLI binary
 
 
 @dataclass

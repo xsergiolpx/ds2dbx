@@ -87,6 +87,9 @@ def init(
     switch_volume = typer.prompt("  Switch staging volume", default="switch_volume")
     data_volume = typer.prompt("  Data upload volume", default="sample_data")
     model = typer.prompt("  Foundation model endpoint", default="databricks-claude-opus-4-6")
+    cli_path = typer.prompt(
+        "  Databricks CLI path (leave empty if on PATH)", default=""
+    )
 
     # --- Build config ---
     cfg = Config()
@@ -99,6 +102,8 @@ def init(
     cfg.lakebridge.switch_volume = switch_volume
     cfg.lakebridge.data_volume = data_volume
     cfg.lakebridge.foundation_model = model
+    if cli_path:
+        cfg.lakebridge.cli_path = cli_path
 
     save_config(cfg, path)
     console.print(f"\n[green]Config written to {path}[/green]")
@@ -120,15 +125,23 @@ def check(
     config_found = any(p.exists() for p in [Path("ds2dbx.yml"), Path.home() / ".ds2dbx" / "config.yml"])
     checks.append(("Config file", config_found, "ds2dbx.yml" if config_found else "Not found — run ds2dbx init"))
 
-    # 2. Databricks CLI
-    r = run_command(["databricks", "--version"])
+    # 2. Databricks CLI — use configured cli_path if set
+    from ds2dbx.utils.lakebridge_resolver import resolve_databricks_cmd, LakebridgeNotFoundError
+    try:
+        cli_bin = resolve_databricks_cmd(cfg)
+    except LakebridgeNotFoundError:
+        cli_bin = "databricks"
+    r = run_command([cli_bin, "--version"])
     cli_ok = r.returncode == 0
     cli_ver = r.stdout.strip().split()[-1] if cli_ok else "not found"
     cli_ver = cli_ver.lstrip("v")
-    checks.append(("Databricks CLI", cli_ok, f"v{cli_ver}" if cli_ok else "Install: https://docs.databricks.com/dev-tools/cli/install.html"))
+    cli_detail = f"v{cli_ver}" if cli_ok else "Install: https://docs.databricks.com/dev-tools/cli/install.html"
+    if cfg.lakebridge.cli_path:
+        cli_detail += f" (cli_path: {cfg.lakebridge.cli_path})"
+    checks.append(("Databricks CLI", cli_ok, cli_detail))
 
     # 3. Auth
-    r = run_command(["databricks", "auth", "env", "--profile", cfg.databricks.profile])
+    r = run_command([cli_bin, "auth", "env", "--profile", cfg.databricks.profile])
     auth_ok = r.returncode == 0 and "DATABRICKS_HOST" in r.stdout
     checks.append(("Authentication", auth_ok, f"Profile: {cfg.databricks.profile}" if auth_ok else "Run: databricks auth login"))
 
@@ -136,15 +149,19 @@ def check(
     host = cfg.get_host()
     checks.append(("Workspace", bool(host), host or "Could not determine host"))
 
-    # 5. Lakebridge — check if the CLI plugin is installed
-    r = run_command(["databricks", "labs", "lakebridge", "transpile", "--help", "--profile", cfg.databricks.profile])
-    lb_ok = r.returncode == 0 and "transpile" in r.stdout.lower()
-    checks.append(("Lakebridge", lb_ok, "Installed" if lb_ok else "Run: databricks labs install lakebridge"))
-
-    # 6. BladeBridge (transpile) + Switch (llm-transpile)
-    r2 = run_command(["databricks", "labs", "lakebridge", "llm-transpile", "--help", "--profile", cfg.databricks.profile])
-    bb_ok = lb_ok and r2.returncode == 0
-    checks.append(("BladeBridge + Switch", bb_ok, "Available" if bb_ok else "Run: databricks labs lakebridge install-transpile"))
+    # 5-6. Lakebridge — check BladeBridge + Switch via resolver
+    from ds2dbx.utils.lakebridge_resolver import check_lakebridge_available
+    bb_ok, sw_ok, lb_diag = check_lakebridge_available(cfg, profile=cfg.databricks.profile)
+    lb_ok = bb_ok and sw_ok
+    if cfg.lakebridge.cli_path:
+        lb_detail = f"cli_path: {cfg.lakebridge.cli_path}"
+    else:
+        lb_detail = "Installed" if bb_ok else "Run: databricks labs install lakebridge"
+    checks.append(("Lakebridge", bb_ok, lb_detail))
+    if bb_ok and sw_ok:
+        checks.append(("BladeBridge + Switch", True, "Available"))
+    else:
+        checks.append(("BladeBridge + Switch", False, lb_diag))
 
     # 7. Foundation Model API — check via workspace (best effort)
     fmapi_ok = True  # Can't easily check without REST call, assume OK if auth works

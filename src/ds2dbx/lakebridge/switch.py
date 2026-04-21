@@ -12,6 +12,7 @@ import yaml
 from rich.console import Console
 
 from ds2dbx.config import Config
+from ds2dbx.utils.lakebridge_resolver import build_lakebridge_cmd, resolve_databricks_cmd, LakebridgeNotFoundError
 from ds2dbx.utils.subprocess_runner import RunResult, run_command
 
 console = Console()
@@ -58,6 +59,7 @@ class SwitchRunner:
         self.config = config
         self.verbose = verbose
         self.profile = config.databricks.profile
+        self._cli = resolve_databricks_cmd(config)
 
     def transpile(
         self,
@@ -99,14 +101,13 @@ class SwitchRunner:
         # Ensure the output workspace folder exists before Switch writes to it.
         # Without this, Switch silently produces no output if the parent doesn't exist.
         run_command(
-            ["databricks", "workspace", "mkdirs", output_ws_folder,
+            [self._cli, "workspace", "mkdirs", output_ws_folder,
              "--profile", self.profile],
             verbose=self.verbose,
             description="Create output folder",
         )
 
-        cmd = [
-            "databricks", "labs", "lakebridge", "llm-transpile",
+        cmd = build_lakebridge_cmd(self.config, "llm-transpile", [
             "--input-source", str(input_dir),
             "--output-ws-folder", output_ws_folder,
             "--source-dialect", "unknown_etl",
@@ -116,7 +117,7 @@ class SwitchRunner:
             "--foundation-model", lb.foundation_model,
             "--accept-terms", "true",
             "--profile", self.profile,
-        ]
+        ])
 
         # Display the command being executed
         cmd_display = " \\\n    ".join(cmd)
@@ -206,7 +207,7 @@ class SwitchRunner:
 
         # 1. Create remote directory for custom prompts
         run_command(
-            ["databricks", "workspace", "mkdirs", prompts_ws, "--profile", self.profile],
+            [self._cli, "workspace", "mkdirs", prompts_ws, "--profile", self.profile],
             verbose=self.verbose,
         )
 
@@ -221,7 +222,7 @@ class SwitchRunner:
         remote_prompt_path = f"{prompts_ws}/{filename}"
         run_command(
             [
-                "databricks", "workspace", "import", remote_prompt_path,
+                self._cli, "workspace", "import", remote_prompt_path,
                 "--file", tmp_path,
                 "--format", "AUTO",
                 "--profile", self.profile,
@@ -260,7 +261,7 @@ class SwitchRunner:
         )
         run_command(
             [
-                "databricks", "workspace", "import", config_ws,
+                self._cli, "workspace", "import", config_ws,
                 "--file", config_tmp,
                 "--format", "AUTO",
                 "--profile", self.profile,
@@ -348,7 +349,7 @@ class SwitchRunner:
             # Try listing subfolders in case Switch put output one level deeper
             list_result = run_command(
                 [
-                    "databricks", "workspace", "list", ws_folder,
+                    self._cli, "workspace", "list", ws_folder,
                     "--output", "json",
                     "--profile", self.profile,
                 ],
@@ -414,7 +415,7 @@ class SwitchRunner:
 
             export_result = run_command(
                 [
-                    "databricks", "workspace", "export", remote_path,
+                    self._cli, "workspace", "export", remote_path,
                     "--file", str(local_path),
                     "--profile", self.profile,
                 ],

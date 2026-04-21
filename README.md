@@ -59,11 +59,84 @@ Source data (CSV-loaded tables) → `source_schema`. Pipeline output → `target
 
 1. **Python 3.10+**
 2. **Databricks CLI** — authenticated to your workspace
-3. **Lakebridge** with BladeBridge and Switch plugins:
-   ```bash
-   databricks labs install lakebridge
-   ```
-4. **Workspace:** Unity Catalog enabled + Foundation Model API with `databricks-claude-opus-4-6`
+3. **Lakebridge** with BladeBridge (rule-based) and Switch (LLM) converters installed
+4. **Workspace:** Unity Catalog enabled + Foundation Model API with `databricks-claude-opus-4-7`
+
+---
+
+## Installing Lakebridge
+
+Lakebridge is a Databricks Labs CLI plugin that provides two conversion engines:
+- **BladeBridge** — rule-based DataStage XML parser (deterministic, fast)
+- **Switch** — LLM-based transpiler using Foundation Model API (handles complex logic)
+
+### Step 1: Install the Lakebridge CLI plugin
+
+```bash
+databricks labs install lakebridge
+```
+
+This installs the base plugin. You'll be prompted to select a Databricks profile for authentication.
+
+### Step 2: Install the DataStage converter (BladeBridge) and LLM converter (Switch)
+
+After the base plugin is installed, run:
+
+```bash
+databricks labs lakebridge install-transpile
+```
+
+This installs both the BladeBridge rule-based transpiler and the Switch LLM transpiler.
+
+### Step 3: Verify the installation
+
+```bash
+# Check BladeBridge is available
+databricks labs lakebridge transpile --help
+
+# Check Switch (LLM transpiler) is available
+databricks labs lakebridge llm-transpile --help
+```
+
+Both commands should print help text without errors.
+
+You can also verify via ds2dbx:
+
+```bash
+ds2dbx check
+```
+
+This runs all prerequisite checks including Lakebridge availability.
+
+### Troubleshooting Lakebridge Installation
+
+| Problem | Solution |
+|---|---|
+| `Error: unknown command "lakebridge"` | Plugin not installed. Run `databricks labs install lakebridge` |
+| `Error: unknown command "transpile"` | Converters not installed. Run `databricks labs lakebridge install-transpile` |
+| `403 Forbidden` during install or convert | GitHub rate limit. Set env var: `export DATABRICKS_LABS_SKIP_UPDATE_CHECK=true` |
+| Plugin installed but `ds2dbx check` fails | Set `lakebridge.cli_path` in `ds2dbx.yml` to the full path of your `databricks` binary (find it with `which databricks`) |
+| `llm-transpile` not found after install | Reinstall with `databricks labs lakebridge install-transpile --force` |
+| Permission denied on macOS | Run `chmod +x $(which databricks)` or reinstall via Homebrew: `brew install databricks/tap/databricks` |
+
+### Custom CLI path
+
+If `databricks` is not on your PATH or ds2dbx can't detect it, add the explicit path to your `ds2dbx.yml`:
+
+```yaml
+lakebridge:
+  cli_path: /usr/local/bin/databricks   # Full path to the databricks binary
+  switch_catalog: vn
+  switch_schema: lakebridge
+  # ... other settings
+```
+
+Find your binary path with:
+```bash
+which databricks
+# or on macOS:
+mdfind -name databricks | grep -E '/databricks$'
+```
 
 ---
 
@@ -73,7 +146,7 @@ Source data (CSV-loaded tables) → `source_schema`. Pipeline output → `target
 git clone https://github.com/xsergiolpx/ds2dbx.git
 cd ds2dbx
 pip install -e .
-ds2dbx version   # Expected: ds2dbx 0.7.0
+ds2dbx version   # Expected: ds2dbx 0.8.8
 ```
 
 ---
@@ -98,11 +171,12 @@ target_schema: ds2dbx_target
 workspace:
   base_path: /Workspace/Users/{username}/ds2dbx_output
 lakebridge:
+  cli_path: ""                                    # Optional: full path to databricks CLI binary
   switch_catalog: vn
   switch_schema: lakebridge
   switch_volume: switch_volume
   data_volume: sample_data
-  foundation_model: databricks-claude-opus-4-6
+  foundation_model: databricks-claude-opus-4-7
   target_technology: PYSPARK
   concurrency: 4
   max_fix_attempts: 5
@@ -280,6 +354,8 @@ databricks jobs get --job-id <JOB_ID> --output json
 |---|---|
 | `pip install` hangs | `pip install -e . --no-deps --no-build-isolation` or `--index-url https://pypi.org/simple/` |
 | `ds2dbx check` fails auth | `databricks auth login --profile DEFAULT` |
+| `ds2dbx check` can't find Lakebridge | Set `lakebridge.cli_path` in `ds2dbx.yml` to the output of `which databricks` |
+| Lakebridge `403 Forbidden` errors | `export DATABRICKS_LABS_SKIP_UPDATE_CHECK=true` before running ds2dbx |
 | Switch timeout / empty output | Increase `max_fix_attempts` in config; check workspace compute limits |
 | Pass skipped ("already completed") | Use `--force` to re-run |
 | `TABLE_OR_VIEW_NOT_FOUND` at runtime | Deploy with `--run-prereqs` to auto-create source views |

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ds2dbx"
-version = "0.8.8"
+version = "0.8.9"
 description = "CLI tool for end-to-end IBM DataStage to Databricks migration using Lakebridge"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"

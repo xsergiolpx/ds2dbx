@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -35,6 +36,9 @@ def run_command(
     if verbose:
         console.print(f"  [dim]$ {cmd_str}[/dim]")
 
+    # Skip GitHub update check for databricks labs commands (avoids 403 rate limiting)
+    env = {**os.environ, "DATABRICKS_LABS_SKIP_UPDATE_CHECK": "true"}
+
     start = time.time()
     try:
         result = subprocess.run(
@@ -43,6 +47,7 @@ def run_command(
             capture_output=capture,
             text=True,
             timeout=timeout,
+            env=env,
         )
         duration = time.time() - start
 
