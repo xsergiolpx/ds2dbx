@@ -136,20 +136,15 @@ def check(
     host = cfg.get_host()
     checks.append(("Workspace", bool(host), host or "Could not determine host"))
 
-    # 5. Lakebridge
-    r = run_command(["databricks", "labs", "lakebridge", "describe-transpile", "--profile", cfg.databricks.profile])
-    lb_ok = r.returncode == 0
+    # 5. Lakebridge — check if the CLI plugin is installed
+    r = run_command(["databricks", "labs", "lakebridge", "transpile", "--help", "--profile", cfg.databricks.profile])
+    lb_ok = r.returncode == 0 and "transpile" in r.stdout.lower()
     checks.append(("Lakebridge", lb_ok, "Installed" if lb_ok else "Run: databricks labs install lakebridge"))
 
-    # 6. BladeBridge
-    bb_ok = lb_ok and "Bladebridge" in r.stdout
-    bb_ver = ""
-    if bb_ok:
-        for line in r.stdout.splitlines():
-            if "Bladebridge" in line:
-                parts = line.split()
-                bb_ver = parts[1] if len(parts) > 1 else "unknown"
-    checks.append(("BladeBridge plugin", bb_ok, f"v{bb_ver}" if bb_ok else "Run: databricks labs lakebridge install-transpile"))
+    # 6. BladeBridge (transpile) + Switch (llm-transpile)
+    r2 = run_command(["databricks", "labs", "lakebridge", "llm-transpile", "--help", "--profile", cfg.databricks.profile])
+    bb_ok = lb_ok and r2.returncode == 0
+    checks.append(("BladeBridge + Switch", bb_ok, "Available" if bb_ok else "Run: databricks labs lakebridge install-transpile"))
 
     # 7. Foundation Model API — check via workspace (best effort)
     fmapi_ok = True  # Can't easily check without REST call, assume OK if auth works
