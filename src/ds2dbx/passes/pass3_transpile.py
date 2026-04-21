@@ -234,6 +234,121 @@ def _post_process_notebook(
         content,
     )
 
+    # --- Fix 0c: BladeBridge connection attribute placeholders ---
+    # BladeBridge emits #CONN_NAME.ATTR_NAME# placeholders for connection params.
+    # Convert to f-string widget references: #DB_JDBC_CON.DB_SCHEMA# → {DB_JDBC_CON_DB_SCHEMA}
+    content = re.sub(
+        r'#(\w+)\.(\w+)#',
+        lambda m: f'{{{m.group(1)}_{m.group(2)}}}',
+        content,
+    )
+
+    # --- Fix 0d: TEMP_TABLE_*# placeholders → f-string widget variables ---
+    # BladeBridge emits TEMP_TABLE_VAR# for parameterized values.
+    # Convert: TEMP_TABLE_posn_dt# → {posn_dt}, TEMP_TABLE_JOB_NM# → {JOB_NM}
+    # Also handles compound: TEMP_TABLE_RCNCL_CON.DB_SCHEMA#.JOB_RCNCL
+    # → {RCNCL_CON_DB_SCHEMA}.JOB_RCNCL (dot in CONN.ATTR becomes underscore)
+    content = re.sub(
+        r"TEMP_TABLE_([\w.]+?)#",
+        lambda m: '{' + m.group(1).replace('.', '_') + '}',
+        content,
+    )
+
+    # --- Fix 0e: CurrentTimestamp() → current_timestamp() ---
+    content = re.sub(r'\bCurrentTimestamp\s*\(\s*\)', 'current_timestamp()', content)
+
+    # --- Fix 0f: BladeBridge date format strings ---
+    # YYYY-MM-DD %hh:%nn:%ss → yyyy-MM-dd HH:mm:ss
+    content = content.replace("'YYYY-MM-DD %hh:%nn:%ss'", "'yyyy-MM-dd HH:mm:ss'")
+    content = content.replace("'YYYY-MM-DD'", "'yyyy-MM-dd'")
+
+    # --- Fix 0g: BladeBridge .csv('') target → .saveAsTable() ---
+    # BladeBridge generates: DF.write.format('csv').option('header','true').mode('overwrite').option(sep,',').csv('')
+    # Replace with: DF.write.mode('overwrite').saveAsTable("catalog.schema.TABLE_NAME")
+    if ".csv('')" in content:
+        # Find the target table name from the nearest comment "# Processing node TARGET_NAME, type TARGET"
+        target_names = re.findall(
+            r'# Processing node (\w+), type TARGET\n# COLUMN COUNT:.*\n\n(\w+)',
+            content,
+        )
+        for node_name, df_var in target_names:
+            # Replace the CSV write with saveAsTable
+            csv_write_pattern = (
+                rf"{re.escape(df_var)}\.write\.format\('csv'\)\.option\('header','true'\)"
+                rf"\.mode\('overwrite'\)\.option\(sep,','\)\.csv\(''\)"
+            )
+            replacement = (
+                f'{df_var}.write.mode("overwrite").saveAsTable('
+                f'"{catalog}.{target_schema}.{node_name}")'
+            )
+            content = re.sub(csv_write_pattern, replacement, content)
+        # Fallback: catch any remaining .csv('') patterns
+        content = re.sub(
+            r"(\w+)\.write\.format\('csv'\)\.option\('header','true'\)"
+            r"\.mode\('overwrite'\)\.option\(sep,','\)\.csv\(''\)",
+            lambda m: f'{m.group(1)}.write.mode("overwrite").saveAsTable('
+            f'"{catalog}.{target_schema}.{{TABLE_NAME}}")',
+            content,
+        )
+
+    # --- Fix 0h: BladeBridge || string concat → concat() in PySpark ---
+    # In filter/select expressions: lit(posn_dt) || ' 00:00:00' → concat(lit(posn_dt), lit(' 00:00:00'))
+    content = re.sub(
+        r"lit\((\w+)\)\s*\|\|\s*'([^']*)'",
+        r"concat(lit(\1), lit('\2'))",
+        content,
+    )
+
+    # --- Fix 0i: BladeBridge .filter("IsNull ( COL )") → .filter(col("COL").isNull()) ---
+    content = re.sub(
+        r'\.filter\("IsNull\s*\(\s*(\w+)\s*\)"\)',
+        r'.filter(col("\1").isNull())',
+        content,
+    )
+    content = re.sub(
+        r'\.filter\("IsNotNull\s*\(\s*(\w+)\s*\)"\)',
+        r'.filter(col("\1").isNotNull())',
+        content,
+    )
+
+    # --- Fix 0j: BladeBridge expr("IF(...)") → when/otherwise or CASE WHEN ---
+    # expr(f"""IF ( ( SUM_SRC ) IS NOT NULL , ( SUM_SRC ) , 0 ) as TTL_AMT_SRC""")
+    # → when(col("SUM_SRC").isNotNull(), col("SUM_SRC")).otherwise(lit(0)).alias("TTL_AMT_SRC")
+    content = re.sub(
+        r'expr\(f?"""IF\s*\(\s*\(\s*(\w+)\s*\)\s*IS\s+NOT\s+NULL\s*,\s*\(\s*\1\s*\)\s*,\s*(\d+)\s*\)\s*as\s+(\w+)"""\)',
+        r'when(col("\1").isNotNull(), col("\1")).otherwise(lit(\2)).alias("\3")',
+        content,
+        flags=re.IGNORECASE,
+    )
+
+    # --- Fix 0k: Convert saveAsTable plain strings with {VAR} to proper table refs ---
+    # After Fix 0d, saveAsTable('{RCNCL_CON_DB_SCHEMA}.JOB_RCNCL', mode='append')
+    # needs to become saveAsTable('catalog.target_schema.JOB_RCNCL', mode='append')
+    content = re.sub(
+        r"saveAsTable\(['\"](?:\{[^}]+\}\.)?JOB_RCNCL['\"]",
+        f"saveAsTable('{catalog}.{target_schema}.JOB_RCNCL'",
+        content,
+    )
+    # For data target tables: saveAsTable('{VAR}.TABLE') → saveAsTable('catalog.target_schema.TABLE')
+    content = re.sub(
+        r"saveAsTable\(['\"]?\{(\w+)\}\.(\w+)['\"]?",
+        lambda m: f"saveAsTable('{catalog}.{target_schema}.{m.group(2)}'",
+        content,
+    )
+
+    # --- Fix 0l: Ensure spark.sql uses f-strings when containing {VAR} ---
+    # After fix 0c/0d, SQL strings may have {VAR} refs but not be f-strings
+    content = re.sub(
+        r'spark\.sql\("""(.*?\{[A-Z_]\w*\}.*?)"""\)',
+        r'spark.sql(f"""\1""")',
+        content,
+        flags=re.DOTALL,
+    )
+
+    # --- Fix 0m: Remove trailing semicolons inside spark.sql() ---
+    # BladeBridge leaves SQL semicolons: spark.sql(f"""SELECT ... ;""")
+    content = re.sub(r';("""\s*\))', r'\1', content)
+
     # --- Fix 1: UserVar notebooks ---
     if "dbutils.jobs.taskValues.set" in content and _USERVAR_SELECT_RE.search(content):
         content = _fix_uservar_notebook(content)
@@ -258,8 +373,8 @@ def _post_process_notebook(
 
     # --- Fix 4b: Wrap JOB_RCNCL saveAsTable with retry for concurrent writes ---
     # Parallel sub-workflows write to JOB_RCNCL simultaneously → ConcurrentAppendException.
-    # Wrap the write in a retry loop.
-    if "JOB_RCNCL" in content and "saveAsTable" in content:
+    # Wrap the write in a retry loop. Skip if already wrapped.
+    if "JOB_RCNCL" in content and "saveAsTable" in content and "_retry" not in content:
         # Replace: RCNL.write.mode('append').saveAsTable(...)
         # With: retry wrapper
         content = re.sub(
@@ -378,6 +493,24 @@ def _post_process_notebook(
             content = content.replace(
                 f"FROM {catalog}.{source_schema}.",
                 f"FROM {catalog}.{target_schema}.",
+            )
+
+    # --- Fix 10b2: Ensure {target_schema} variable is defined when referenced ---
+    # LLM sometimes uses {target_schema} in SQL but only defines `schema` variable.
+    # Add target_schema alias or replace reference.
+    if "{target_schema}" in content and "target_schema" not in {
+        m.group(1) for m in re.finditer(r'^(\w+)\s*=\s*', content, re.MULTILINE)
+    }:
+        # Check if 'schema' is defined with target value
+        if f'schema = "{target_schema}"' in content:
+            content = content.replace("{target_schema}", "{schema}")
+        else:
+            # Add target_schema definition after catalog/schema defs
+            content = re.sub(
+                r'(schema\s*=\s*"[^"]*")',
+                rf'\1\ntarget_schema = "{target_schema}"',
+                content,
+                count=1,
             )
 
     # --- Fix 10c: DIH_TO_BIGDATA_TO_IN notebooks must write to IN_{TBL_NM} ---
